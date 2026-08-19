@@ -62,12 +62,14 @@ function wirePlatformEvents(
   platformId: string,
   client: PlatformClient,
   session: SessionManager,
-  ui: UIProvider
+  ui: UIProvider,
+  directChannelMode?: boolean
 ): void {
   // Handle incoming messages
   client.on('message', async (post: PlatformPost, user: PlatformUser | null) => {
     await handleMessage(client, session, post, user, {
       platformId,
+      directChannelMode,
       logger: {
         error: (msg) => ui.addLog({ level: 'error', component: '❌', message: msg }),
       },
@@ -660,7 +662,7 @@ async function startWithoutDaemon() {
     ));
 
     // Wire up platform events
-    wirePlatformEvents(platformConfig.id, client, session, ui);
+    wirePlatformEvents(platformConfig.id, client, session, ui, platformConfig.directChannelMode);
   }
 
   // Connect only enabled platforms

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Direct channel mode (DCM)** - Opt-in per platform via `directChannelMode: true`: the whole configured channel behaves as one session. Messages reach the bot without an `@mention`, and the bot replies with top-level channel posts instead of thread replies, so the channel reads like a plain conversation (#315). Internally the session is keyed by a synthetic thread id (`dcm:<platform id>`) that the platform clients resolve to a channel-root post, which keeps persistence, resume, reaction-based permission prompts, and `!commands` working unchanged. Messages posted inside any thread of the channel route to the same session; the thread-context prompt is skipped (there is no thread history behind the synthetic id). Default off — thread-per-session behavior is unchanged.
+
 ## [1.25.0] - 2026-08-19
 
 ### Added
