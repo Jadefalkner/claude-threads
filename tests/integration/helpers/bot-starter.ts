@@ -121,6 +121,13 @@ export interface StartBotOptions {
    */
   mattermostChannelId?: string;
   /**
+   * Direct channel mode for the bot's platform entry (shorthand boolean or
+   * options object, same as config.yaml). Default: off.
+   */
+  directChannelMode?: import('../../../src/platform/utils.js').DirectChannelModeConfig;
+  /** Platform-level approvals mode (owner | all_users). Default: unset. */
+  approvals?: import('../../../src/platform/utils.js').ApprovalsMode;
+  /**
    * Reuse a specific platform id instead of minting a fresh per-start one
    * (Mattermost mints `test-mattermost-<pool>-<seq>` per start). Needed for
    * restart-resume tests: persisted sessions are keyed by
@@ -159,6 +166,8 @@ export async function startTestBot(options: StartBotOptions = {}): Promise<TestB
     slackBotName = 'claude-test-bot',
     mattermostChannelId,
     platformIdOverride,
+    directChannelMode,
+    approvals,
   } = options;
 
   // Load test config
@@ -270,6 +279,8 @@ export async function startTestBot(options: StartBotOptions = {}): Promise<TestB
       botName: poolBot.username,
       allowedUsers,
       skipPermissions,
+      directChannelMode,
+      approvals,
     };
 
     platformClient = new MattermostClient(platformConfig);
@@ -300,6 +311,7 @@ export async function startTestBot(options: StartBotOptions = {}): Promise<TestB
   platformClient.on('message', async (post: PlatformPost, user: PlatformUser | null) => {
     await handleMessage(platformClient, sessionManager, post, user, {
       platformId,
+      directChannelMode,
       logger: debug ? {
         error: (msg) => console.error('[test-bot]', msg),
       } : undefined,
