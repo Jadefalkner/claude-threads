@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Platform-level `approvals` option** - `owner | all_users` controls who may answer tool-permission prompts and the other reaction gates (plan approvals, question answers, resume): the session participants (starter + `!invite`d), or everyone on the platform's `allowedUsers` list. Unset keeps the historical default per mode — `all_users` for thread sessions (unchanged upstream behavior), `owner` for direct channel mode — so the option is purely opt-in for existing setups; `approvals: owner` on a thread channel is an opt-in hardening.
 - **DM auto-discovery (Mattermost)** - `directMessages: true` on a platform entry lets anyone on its `allowedUsers` start a bot DM "out of the cold": the first message spawns a derived direct-channel-mode instance for that DM channel (sticky hidden, scoped to the DM partner incl. tool-permission approvals), and persisted DM sessions are reconstructed after a restart. Mattermost only — Slack's Socket Mode envelope distribution makes per-DM connections unsafe there.
 
+### Fixed
+- **Permission prompts show the full Bash command.** The approval prompt used to hard-truncate commands at 100 characters, so anything past the first pipe or `&&` was invisible at the exact moment the user was asked to approve it — the gate could only be rubber-stamped. The prompt now shows the command up to a generous 1500-character cap (a pathological command is still cut so it cannot blow up the prompt post). The 50-character display truncation in the streaming view is unchanged; only the permission prompt is affected.
+
 ## [1.25.0] - 2026-08-19
 
 ### Added
