@@ -7,18 +7,23 @@ import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { configureAuditLog, _resetAuditLog } from './persistence/audit-log.js';
-import { handleMessage, type MessageHandlerOptions } from './message-handler.js';
+import { handleMessage, isClaudeThreadsStatusPost, type MessageHandlerOptions } from './message-handler.js';
 import type { PlatformClient, PlatformPost, PlatformUser } from './platform/index.js';
 import type { SessionManager } from './session/index.js';
 import { createMockFormatter } from './test-utils/mock-formatter.js';
+import { resetResumeRefusalLimiter } from './session/refusal-limiter.js';
+
+// The refusal limiter is module-global state; every test starts unthrottled.
+beforeEach(() => resetResumeRefusalLimiter());
 
 // Create mock platform client
-function createMockPlatform(botName = 'claude-bot') {
+function createMockPlatform(botName = 'claude-bot', platformType = 'slack') {
   const posts: Map<string, string> = new Map();
   let postIdCounter = 1;
 
   return {
     platformId: 'test-platform',
+    platformType,
     createPost: mock(async (message: string, threadId?: string): Promise<PlatformPost> => {
       const id = `post_${postIdCounter++}`;
       posts.set(id, message);
@@ -53,6 +58,7 @@ function createMockSessionManager() {
   return {
     // Note: isInSessionThread and hasPausedSession removed - code uses registry directly
     isUserAllowedInSession: mock(() => true),
+    addSideConversation: mock(() => {}),
     getActiveThreadIds: mockGetActiveThreadIds,
     registry: {
       getActiveThreadIds: mockGetActiveThreadIds,
@@ -78,6 +84,7 @@ function createMockSessionManager() {
     hasPendingWorktreePrompt: mock(() => false),
     handleWorktreeBranchResponse: mock(async () => false),
     sendFollowUp: mock(async () => {}),
+    evaluateWatches: mock(() => {}),
     resumePausedSession: mock(async () => {}),
     cancelPausedSession: mock(() => {}),
     startSession: mock(async () => {}),
@@ -363,6 +370,113 @@ describe('handleMessage', () => {
       await handleMessage(client, session, post, user, options);
 
       expect(session.sendFollowUp).not.toHaveBeenCalled();
+      expect(session.addSideConversation).toHaveBeenCalledWith('thread1', expect.objectContaining({
+        fromUser: 'allowed-user',
+        mentionedUser: 'someone-else',
+      }));
+    });
+
+    test('ignores side conversations in Slack raw mention form (<@U…>)', async () => {
+      // Slack delivers mentions as '<@U0BOB>', never '@bob' — a guard
+      // matching only '@name' is a silent no-op on Slack.
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '<@U0BOB> did you deploy?',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.sendFollowUp).not.toHaveBeenCalled();
+      expect(session.addSideConversation).toHaveBeenCalledWith('thread1', expect.objectContaining({
+        mentionedUser: 'U0BOB',
+      }));
+    });
+
+    test('a message that ALSO mentions the bot is a follow-up, not a side conversation', async () => {
+      // '@bob can you review? @claude-bot please summarize' explicitly asks
+      // the bot — dropping it as a human-to-human aside loses a real request
+      // (the DCM new-session guard already exempts bot mentions).
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '@bob can you review? @claude-bot please summarize the diff',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.addSideConversation).not.toHaveBeenCalled();
+      expect(session.sendFollowUp).toHaveBeenCalled();
+    });
+
+    test('a literal <@…> token on Mattermost is ordinary text, not an address', async () => {
+      // Mattermost never produces raw mention tokens — someone pasting
+      // Slack output must not have their follow-up silently dropped.
+      client = createMockPlatform('claude-bot', 'mattermost');
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '<@U0BOB> is what the Slack log said — can you check it?',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.addSideConversation).not.toHaveBeenCalled();
+      expect(session.sendFollowUp).toHaveBeenCalled();
+    });
+
+    test("Slack's legacy labeled mention form <@U0…|name> is recognized too", async () => {
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '<@U0BOB|bob> did you deploy?',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.sendFollowUp).not.toHaveBeenCalled();
+      expect(session.addSideConversation).toHaveBeenCalledWith('thread1', expect.objectContaining({
+        mentionedUser: 'U0BOB',
+      }));
+    });
+
+    test('a raw-form mention of the BOT is a follow-up, not a side conversation', async () => {
+      (client.isBotMentioned as any).mockImplementation((m: string) => m.includes('<@UBOT123>'));
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '<@UBOT123> what is the status?',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.addSideConversation).not.toHaveBeenCalled();
+      expect(session.sendFollowUp).toHaveBeenCalled();
     });
 
     test('sends follow-up for regular messages', async () => {
@@ -587,7 +701,26 @@ describe('handleMessage', () => {
 
       await handleMessage(client, session, post, user, options);
 
-      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'continue please', undefined, 'allowed-user');
+      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'continue please', undefined, 'allowed-user', 'test-platform');
+    });
+
+    test('a message addressing another user does not resume (Slack raw form)', async () => {
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '<@U0BOB> can you take this one?',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.resumePausedSession).not.toHaveBeenCalled();
+      // Silent skip: no rejection post either — it's a human-to-human aside.
+      expect(client.createPost).not.toHaveBeenCalled();
     });
 
     test('rejects resume from an allowlisted non-participant under approvals: owner', async () => {
@@ -644,7 +777,7 @@ describe('handleMessage', () => {
       await handleMessage(client, session, post, user, options);
 
       expect(session.resumePausedSession).not.toHaveBeenCalled();
-      expect(session.cancelPausedSession).toHaveBeenCalledWith('thread1');
+      expect(session.cancelPausedSession).toHaveBeenCalledWith('thread1', 'test-platform');
       // Should post a cancellation confirmation
       const postCalls = (client.createPost as any).mock.calls;
       const lastMessage = postCalls[postCalls.length - 1]?.[0];
@@ -666,7 +799,183 @@ describe('handleMessage', () => {
       await handleMessage(client, session, post, user, options);
 
       expect(session.resumePausedSession).not.toHaveBeenCalled();
-      expect(session.cancelPausedSession).toHaveBeenCalledWith('thread1');
+      expect(session.cancelPausedSession).toHaveBeenCalledWith('thread1', 'test-platform');
+    });
+
+    test('a stopped thread starts a FRESH session, it does not resume', async () => {
+      // The end-to-end shape of the bug, from the operator's side. After
+      // `!stop` the record is a 'stopped' tombstone, which the paused-session
+      // gate now hides — so the next message must reach the new-session path.
+      //
+      // Getting this wrong in either direction is bad: leave the record
+      // visible and the thread is trapped (the original bug); revive it and
+      // `!stop` silently undoes itself, resurrecting a conversation that has
+      // already been distilled into channel memory as ended.
+      (session.registry.getPersistedByThreadId as any).mockReturnValue(undefined);
+      (session.getPersistedSession as any).mockReturnValue(undefined);
+
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '@claude-bot pick this back up',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.resumePausedSession).not.toHaveBeenCalled();
+      expect(session.startSession).toHaveBeenCalled();
+    });
+
+    test('a bare !stop on a stopped thread is a no-op, not a new prompt', async () => {
+      // Once stopped tombstones route to the new-session path, `!stop` reaches
+      // it too. It is not `worksInFirstMessage`, so without the guard it falls
+      // through and starts a session whose opening prompt is the literal text
+      // "!stop" — a bot that answers a request to stop by starting.
+      (session.registry.getPersistedByThreadId as any).mockReturnValue(undefined);
+      (session.getPersistedSession as any).mockReturnValue(undefined);
+
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '@claude-bot !stop',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.startSession).not.toHaveBeenCalled();
+    });
+
+    test('a non-allowlisted user gets no commands in a paused thread', async () => {
+      // The paused branch must not become the one place an outsider can run
+      // first-message commands. `worksInFirstMessage` covers `!worktree list`
+      // and `!worktree switch`, which post repository branches and absolute
+      // paths, and several handlers never consult `ctx.isAllowed` themselves —
+      // so the refusal has to happen before the executor, exactly as the
+      // new-session path does it.
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '!help',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const outsider: PlatformUser = { id: 'u9', username: 'random-person', displayName: 'Nope' };
+
+      await handleMessage(client, session, post, outsider, options);
+
+      // `!help` is the mildest thing behind that gate and the easiest to
+      // observe; the same refusal is what keeps `!worktree list` and
+      // `!worktree switch` — which post branch names and absolute paths —
+      // from answering an outsider here.
+      expect(client.createPost).not.toHaveBeenCalled();
+    });
+
+    test('!help still answers in a paused thread', async () => {
+      // Regression: every command except !stop was consumed here in silence.
+      // !help needs no session at all, and it is the first thing anyone tries
+      // when a thread stops answering — so the one command that could explain
+      // the situation was also the one guaranteed to say nothing, making a
+      // stuck thread look like a bot that had gone deaf.
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '!help',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.resumePausedSession).not.toHaveBeenCalled();
+      const helpText = (client.createPost as any).mock.calls.map(([m]: [string]) => m).join('\n');
+      expect(helpText).toContain('!stop');
+    });
+
+    test('!worktree remove is dropped, not silently reported as done', async () => {
+      // `worksInFirstMessage` is not "needs no session". !worktree remove
+      // carries that flag and still calls active-session-only methods: routed
+      // through the first-message executor in a paused thread it finds no
+      // session, does nothing, and returns handled — succeeding at nothing,
+      // quietly, which is the exact shape of failure this branch exists to
+      // stop producing.
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '!worktree remove some-branch',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.removeWorktreeCommand).not.toHaveBeenCalled();
+      const logged = (options.logger!.debug as any).mock.calls.map(([m]: [string]) => m).join('\n');
+      expect(logged).toContain('worktree');
+      expect(logged).toContain('paused');
+    });
+
+    test('!stop the deploy stays a prompt, not a command', async () => {
+      // The no-op guard is scoped to a bare command. Someone typing "!stop the
+      // deploy" is talking, and must still reach Claude.
+      (session.registry.getPersistedByThreadId as any).mockReturnValue(undefined);
+      (session.getPersistedSession as any).mockReturnValue(undefined);
+
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '@claude-bot !stop the deploy',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.startSession).toHaveBeenCalled();
+    });
+
+    test('a session-only command is dropped, but says so in the log', async () => {
+      // The other half: commands that genuinely need a live session still
+      // cannot run — but the drop is recorded, so the next person debugging a
+      // quiet thread sees a reason instead of nothing at all.
+      const post: PlatformPost = {
+        id: 'post1',
+        platformId: 'test',
+        channelId: 'channel1',
+        userId: 'user1',
+        message: '!escape',
+        rootId: 'thread1',
+        createAt: Date.now(),
+      };
+      const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+      await handleMessage(client, session, post, user, options);
+
+      expect(session.resumePausedSession).not.toHaveBeenCalled();
+      expect(session.interruptSession).not.toHaveBeenCalled();
+      const logged = (options.logger!.debug as any).mock.calls.map(([m]: [string]) => m).join('\n');
+      expect(logged).toContain('escape');
+      expect(logged).toContain('paused');
     });
 
     test('other commands in paused session do not resume', async () => {
@@ -730,7 +1039,7 @@ describe('handleMessage', () => {
 
       await handleMessage(client, session, post, user, options);
 
-      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'please continue', undefined, 'allowed-user');
+      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'please continue', undefined, 'allowed-user', 'test-platform');
     });
 
     test('quiet mode off (default): a non-mention reply still resumes the paused session', async () => {
@@ -752,7 +1061,7 @@ describe('handleMessage', () => {
 
       await handleMessage(client, session, post, user, options);
 
-      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'continue please', undefined, 'allowed-user');
+      expect(session.resumePausedSession).toHaveBeenCalledWith('thread1', 'continue please', undefined, 'allowed-user', 'test-platform');
     });
   });
 
@@ -2200,14 +2509,42 @@ describe('direct channel mode (DCM)', () => {
     expect(session.startSession).not.toHaveBeenCalled();
   });
 
-  test('unauthorized users are rejected as usual', async () => {
+  test('unauthorized users are silently ignored unless they @mention the bot', async () => {
+    // In all-messages DCM EVERY channel message from a non-allowlisted
+    // member reaches the authorization check — an unconditional warning
+    // would be unbounded channel spam (and lets two bots warn at each
+    // other in a loop on Mattermost, which passes other bots' posts
+    // through).
     const badUser: PlatformUser = { id: 'u2', username: 'stranger', displayName: 'Stranger' };
 
     await handleMessage(client, session, makePost(), badUser, options);
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect([...client.posts.values()].join('\n')).not.toContain('not authorized');
+
+    // An explicit @mention still gets the warning — the user addressed the bot.
+    await handleMessage(client, session, makePost({ message: '@claude-bot help me' }), badUser, options);
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect([...client.posts.values()].join('\n')).toContain('not authorized');
+  });
+
+  test('a message addressed to another user never starts a session (side conversation)', async () => {
+    // The active- and paused-session paths ignore @someone-else messages;
+    // without the same guard here, '@bob did you deploy?' in a fresh DCM
+    // channel would start a Claude session in a human-to-human exchange.
+    await handleMessage(client, session, makePost({ message: '@bob did you deploy?' }), user, options);
 
     expect(session.startSession).not.toHaveBeenCalled();
-    const posted = [...client.posts.values()].join('\n');
-    expect(posted).toContain('not authorized');
+    expect(session.sendFollowUp).not.toHaveBeenCalled();
+  });
+
+  test('the side-conversation guard also understands Slack raw mentions', async () => {
+    // Slack delivers '<@U0BOB> did you deploy?' — the raw user-id form.
+    // A guard matching only '@name' never fires on Slack, so every aside
+    // between two humans would start a Claude session.
+    await handleMessage(client, session, makePost({ message: '<@U0BOB> did you deploy?' }), user, options);
+
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect(session.sendFollowUp).not.toHaveBeenCalled();
   });
 
 
@@ -2238,4 +2575,218 @@ describe('direct channel mode (DCM)', () => {
     expect(session.sendFollowUp).not.toHaveBeenCalled();
   });
 
+});
+
+describe('handleMessage - legacy paused-session resume', () => {
+  test("approvals 'owner' + a legacy record without sessionAllowedUsers still lets the owner resume", async () => {
+    // Legacy persisted sessions (pre-collaboration versions) have no
+    // sessionAllowedUsers. Under approvals 'owner' the global-allowlist
+    // rescue is dropped, so without the [startedBy] fallback the owner's
+    // own reply would be rejected and the session unresumable by text
+    // (CLAUDE.md backward-compat rule; reaction-router already has the
+    // fallback).
+    const client = createMockPlatform();
+    (client as unknown as { approvals: string }).approvals = 'owner';
+    const session = createMockSessionManager();
+    (session.registry.getPersistedByThreadId as ReturnType<typeof mock>).mockReturnValue({ startedBy: 'allowed-user' });
+    (session.getPersistedSession as ReturnType<typeof mock>).mockReturnValue({ startedBy: 'allowed-user' });
+
+    const post: PlatformPost = {
+      id: 'post1',
+      platformId: 'test',
+      channelId: 'channel1',
+      userId: 'user1',
+      message: 'please continue',
+      rootId: 'thread-1',
+      createAt: Date.now(),
+    };
+    const owner: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+    await handleMessage(client, session, post, owner, { platformId: 'test-platform' });
+
+    expect(session.resumePausedSession).toHaveBeenCalledTimes(1);
+    const posted = [...client.posts.values()].join('\n');
+    expect(posted).not.toContain('not authorized');
+  });
+});
+
+describe('handleMessage - watch evaluation hook', () => {
+  let client: PlatformClient & { posts: Map<string, string> };
+  let session: ReturnType<typeof createMockSessionManager>;
+
+  const makePost = (overrides: Partial<PlatformPost> = {}): PlatformPost => ({
+    id: 'post1',
+    platformId: 'test',
+    channelId: 'channel1',
+    userId: 'user1',
+    message: 'the deploy pipeline is broken again',
+    rootId: '',
+    createAt: Date.now(),
+    ...overrides,
+  });
+  const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+  beforeEach(() => {
+    client = createMockPlatform();
+    session = createMockSessionManager();
+  });
+
+  test('an otherwise-ignored channel message is offered to the watch evaluator', async () => {
+    await handleMessage(client, session, makePost(), user, { platformId: 'test-platform' });
+
+    expect(session.evaluateWatches).toHaveBeenCalledTimes(1);
+    const call = (session.evaluateWatches as ReturnType<typeof mock>).mock.calls[0];
+    expect(call[0]).toBe('test-platform');
+    expect(call[3]).toBe('the deploy pipeline is broken again');
+  });
+
+  test('a mentioned message is never offered to the watch evaluator', async () => {
+    await handleMessage(client, session, makePost({ message: '@claude-bot do something' }), user, { platformId: 'test-platform' });
+
+    expect(session.evaluateWatches).not.toHaveBeenCalled();
+  });
+
+  test('watches are inert in DCM — a fired session would be keyed on the real thread and unreachable', async () => {
+    // DCM routes every message to the synthetic dcm:<platformId> key, so a
+    // watch-fired session on the message's real thread root could never
+    // receive follow-ups or !stop. respondTo: 'mention' is the only DCM
+    // shape whose non-mention messages even reach the fall-through.
+    await handleMessage(client, session, makePost(), user, {
+      platformId: 'test-platform',
+      directChannelMode: { respondTo: 'mention' },
+    });
+
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect(session.evaluateWatches).not.toHaveBeenCalled();
+  });
+});
+
+describe('bot-to-bot loop prevention (#491)', () => {
+  let client: PlatformClient & { posts: Map<string, string> };
+  let session: ReturnType<typeof createMockSessionManager>;
+
+  const pausedThreadPost = (overrides: Partial<PlatformPost> = {}): PlatformPost => ({
+    id: 'post1',
+    platformId: 'test',
+    channelId: 'channel1',
+    userId: 'user1',
+    message: 'continue please',
+    rootId: 'thread1',
+    createAt: Date.now(),
+    ...overrides,
+  });
+  const outsider: PlatformUser = { id: 'user1', username: 'outsider', displayName: 'Outsider' };
+
+  beforeEach(() => {
+    client = createMockPlatform();
+    session = createMockSessionManager();
+    (session.registry.getPersistedByThreadId as ReturnType<typeof mock>).mockReturnValue({ sessionAllowedUsers: ['allowed-user'] });
+    (session.getPersistedSession as ReturnType<typeof mock>).mockReturnValue({ sessionAllowedUsers: ['allowed-user'] });
+  });
+
+  test('the resume refusal never @-mentions the refused user', async () => {
+    await handleMessage(client, session, pausedThreadPost(), outsider, { platformId: 'test-platform' });
+
+    expect(session.resumePausedSession).not.toHaveBeenCalled();
+    const posted = [...client.posts.values()].join('\n');
+    expect(posted).toContain('is not authorized to resume this session');
+    // Inline code reads the same to a human and notifies nobody.
+    expect(posted).toContain('`outsider`');
+    expect(posted).not.toContain('@outsider');
+  });
+
+  test('the resume refusal fires once per (thread, user), not once per message', async () => {
+    for (let i = 0; i < 4; i++) {
+      await handleMessage(client, session, pausedThreadPost({ id: `post${i}` }), outsider, { platformId: 'test-platform' });
+    }
+
+    const refusals = [...client.posts.values()].filter((m) => m.includes('is not authorized'));
+    expect(refusals).toHaveLength(1);
+  });
+
+  test('a refusal for a different user in the same thread still posts', async () => {
+    await handleMessage(client, session, pausedThreadPost(), outsider, { platformId: 'test-platform' });
+    const other: PlatformUser = { id: 'user2', username: 'other-bot', displayName: 'Other' };
+    await handleMessage(client, session, pausedThreadPost({ id: 'post2' }), other, { platformId: 'test-platform' });
+
+    const refusals = [...client.posts.values()].filter((m) => m.includes('is not authorized'));
+    expect(refusals).toHaveLength(2);
+  });
+
+  test("another bot's refusal post never engages this bot, even when it @-mentions it", async () => {
+    // The incident shape: bot A's refusal @-mentions bot B, which passes B's
+    // mention gate and would start a session / produce a reply — which
+    // re-triggers A. The status-post guard drops it before any routing.
+    const post = pausedThreadPost({
+      message: '⚠️ @claude-bot is not authorized to resume this session',
+      rootId: '',
+    });
+    (session.registry.getPersistedByThreadId as ReturnType<typeof mock>).mockReturnValue(undefined);
+    (session.getPersistedSession as ReturnType<typeof mock>).mockReturnValue(undefined);
+
+    await handleMessage(client, session, post, outsider, { platformId: 'test-platform' });
+
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect(session.resumePausedSession).not.toHaveBeenCalled();
+    expect(client.createPost).not.toHaveBeenCalled();
+  });
+
+  test('status posts are dropped in DCM before routing to the channel session', async () => {
+    (session.registry.getPersistedByThreadId as ReturnType<typeof mock>).mockReturnValue(undefined);
+    (session.getPersistedSession as ReturnType<typeof mock>).mockReturnValue(undefined);
+    const post = pausedThreadPost({
+      message: '⏱️ **Session idle** - will timeout in ~5 minutes without activity',
+      rootId: '',
+    });
+
+    await handleMessage(client, session, post, outsider, {
+      platformId: 'test-platform',
+      directChannelMode: true,
+    });
+
+    expect(session.startSession).not.toHaveBeenCalled();
+    expect(client.createPost).not.toHaveBeenCalled();
+  });
+
+  test('a human message that merely starts with the warning emoji still gets through', async () => {
+    (session.registry.getPersistedByThreadId as ReturnType<typeof mock>).mockReturnValue(undefined);
+    (session.getPersistedSession as ReturnType<typeof mock>).mockReturnValue(undefined);
+    const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+    const post = pausedThreadPost({
+      message: '⚠️ @claude-bot the staging deploy looks broken, can you check?',
+      rootId: '',
+    });
+
+    await handleMessage(client, session, post, user, { platformId: 'test-platform' });
+
+    expect(session.startSession).toHaveBeenCalled();
+  });
+});
+
+describe('isClaudeThreadsStatusPost (#491)', () => {
+  test.each([
+    ['⚠️ @some-bot is not authorized to resume this session'],
+    ['⚠️ `some-bot` is not authorized to resume this session'],
+    ['⚠️ <@U0BOTB> is not authorized'],
+    ['⚠️ **Too busy** - 5 sessions active. Please try again later.'],
+    ['⚠️ *Too busy* - 5 sessions active. Please try again later.'],
+    ['⏱️ **Session timed out** after 30 minutes of inactivity'],
+    ['⏱️ *Session idle* - will timeout in ~5 minutes without activity'],
+    ['🛑 **Session cancelled** by @someone'],
+    ['🔴 **EMERGENCY SHUTDOWN** initiated by @someone - killing 2 active sessions'],
+    ['🔄 **Session resumed** by @someone'],
+  ])('recognizes the bot status shape: %s', (message) => {
+    expect(isClaudeThreadsStatusPost(message)).toBe(true);
+  });
+
+  test.each([
+    ['⚠️ careful with the prod database'],
+    ['⚠️ @claude-bot the deploy authorization is broken'],
+    ['hello there'],
+    ['🛑 stop the presses, but read this first'],
+    ['is not authorized to resume this session'],
+    ['something ⚠️ @bot is not authorized'],
+  ])('lets ordinary messages through: %s', (message) => {
+    expect(isClaudeThreadsStatusPost(message)).toBe(false);
+  });
 });

@@ -16,6 +16,7 @@ import { EventEmitter } from 'events';
 import type { PendingBugReport } from './executors/types.js';
 import type { StatusUpdateOp, LifecycleOp } from './types.js';
 import type { ParsedRoutineRequest } from '../routines/parser.js';
+import type { ParsedWatchRequest } from '../watches/parser.js';
 
 // ---------------------------------------------------------------------------
 // Event Payload Types
@@ -95,7 +96,36 @@ export interface MessageManagerEventMap {
     approved: boolean;
     parsed: ParsedRoutineRequest;
     requestedBy: string;
+    /** The user whose reaction decided the confirmation (👍/👎). */
+    decidedBy: string;
     postId: string;
+    /** True when Claude proposed this via the propose_routine MCP tool. */
+    proposedByAgent?: boolean;
+    /**
+     * Approval posture chosen at confirmation: true → fired runs require
+     * in-thread per-action approval (safe default); false → autonomous.
+     */
+    requireApproval?: boolean;
+  };
+
+  /**
+   * Emitted when a watch-creation confirmation receives a response.
+   * The lifecycle listener performs the store write on approval.
+   */
+  'watch-prompt:complete': {
+    approved: boolean;
+    parsed: ParsedWatchRequest;
+    requestedBy: string;
+    /** The user whose reaction decided the confirmation (👍/👎). */
+    decidedBy: string;
+    postId: string;
+    /** True when Claude proposed this via the propose_watch MCP tool. */
+    proposedByAgent?: boolean;
+    /**
+     * Approval posture chosen at confirmation: true → fired runs require
+     * in-thread per-action approval (safe default); false → autonomous.
+     */
+    requireApproval?: boolean;
   };
 
   /**

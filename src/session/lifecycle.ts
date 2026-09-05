@@ -17,12 +17,13 @@ import type { OverheadVisibility, PermissionMode } from '../config/index.js';
 import { DEFAULT_OVERHEAD_VISIBILITY } from '../config/index.js';
 import { clearAllTimers } from './timer-manager.js';
 import { isDcmThreadId, resolveApprovals } from '../platform/utils.js';
-import { isAuthorizedForSession } from './authorization.js';
+import { isAuthorizedForSession, sessionAllowedUserSet } from './authorization.js';
 import type { PlatformClient, PlatformFile } from '../platform/index.js';
 import type { ClaudeCliOptions, ClaudeEvent, RateLimitHit } from '../claude/cli.js';
 import { DecisionBridgeServer, BridgeUnavailableError } from '../mcp/decision-bridge.js';
 import { ClaudeCli } from '../claude/cli.js';
 import { cooldownDeadline } from '../claude/rate-limit-detector.js';
+import { isRevivable } from '../persistence/session-store.js';
 import type { PersistedSession } from '../persistence/session-store.js';
 import { createThreadLogger } from '../persistence/thread-logger.js';
 import { VERSION } from '../version.js';
@@ -39,8 +40,7 @@ import { createSessionLog } from '../utils/session-log.js';
 import { post, postError, updateLastMessage } from '../operations/post-helpers/index.js';
 import { postResumeCoAuthorOnboarding } from '../operations/commands/handler.js';
 import type { SessionContext } from '../operations/session-context/index.js';
-import { suggestSessionMetadata } from '../operations/suggestions/title.js';
-import { suggestSessionTags } from '../operations/suggestions/tag.js';
+import { fireMetadataSuggestions, maybeInjectMetadataReminder } from './metadata-suggestions.js';
 import { MessageManager, PostTracker } from '../operations/index.js';
 import {
   getThreadMessagesForContext,
@@ -56,6 +56,9 @@ import { detectWorktreeInfo } from '../git/worktree.js';
 import { resolveSessionMemory, activeWorktreeRepoRoot } from '../memory/store.js';
 import { scheduleDistillation } from '../memory/distiller.js';
 import { auditLog } from '../persistence/audit-log.js';
+import { compositeSessionId } from './registry.js';
+import { sessionAgentFeatures } from '../claude/restart-options.js';
+import { handleAgentAction } from '../operations/agent-actions/handler.js';
 
 const log = createLogger('lifecycle');
 const sessionLog = createSessionLog(log);
@@ -94,6 +97,126 @@ function releasePendingStart(): void {
  * Exported with an underscore for tests only.
  */
 export const _inFlightSessionStarts = new Map<string, Promise<void>>();
+
+/**
+ * True while a start/resume for this composite session id is in flight but
+ * not yet registered in `ctx.state.sessions`. Unattended callers (watch
+ * fires) must treat an in-flight start like an existing session: calling
+ * startSession during the window would deliver their synthetic prompt into
+ * the other start's session as a follow-up.
+ */
+export function isSessionStartInFlight(sessionId: string): boolean {
+  return _inFlightSessionStarts.has(sessionId);
+}
+
+/**
+ * Shared body of the routine/watch creation-confirmation listeners: audit,
+ * thread-log, and — on approval — a crash-guarded store write followed by a
+ * confirmation-card update. EventEmitter never awaits listeners, so the
+ * store write is try/caught into the visible-failure path: an fs error at
+ * 👍-time must not become a process-killing unhandled rejection.
+ */
+/**
+ * Effective unattended flag for a resumed session. The flag is
+ * security-load-bearing (it gates the agent memory-write and propose_*
+ * tools), and sessions persisted by a pre-agent-tools bot have no
+ * `unattended` field — failing OPEN there would re-arm exactly the
+ * sessions the gate targets during an upgrade. Fall back to the
+ * unattended prompt prefix both runners stamp on their synthetic first
+ * prompt (stable since the features shipped).
+ */
+export function _resumedUnattended(state: PersistedSession): boolean {
+  if (state.unattended !== undefined) return state.unattended;
+  return /^\[(Scheduled routine|Watch) "/.test(state.firstPrompt ?? '');
+}
+
+// Exported for tests (underscore convention, cf. _inFlightSessionStarts):
+// the agent-proposal approval gate below is a security boundary and needs
+// direct red-green coverage.
+export async function _handleCreationConfirmation(
+  session: Session,
+  payload: { approved: boolean; parsed: { name: string }; requestedBy: string; decidedBy: string; postId: string; proposedByAgent?: boolean; requireApproval?: boolean },
+  flavor: {
+    /** Audit tool name and user-facing noun ('routine' | 'watch'). */
+    tool: string;
+    /** Log prefix incl. emoji (e.g. '🕘 Routine'). */
+    logPrefix: string;
+    /** Store file noun for the write-failure message ('routines' | 'watches'). */
+    fileNoun: string;
+    /** Perform the store write; returns the saved name and list position. */
+    save(): Promise<{ ok: true; name: string; position: number } | { ok: false; error: string }>;
+    /** Confirmation-card text for a successful save. */
+    savedText(formatter: ReturnType<Session['platform']['getFormatter']>, position: number, name: string): string;
+  },
+): Promise<void> {
+  const { approved, parsed, requestedBy, decidedBy, postId, proposedByAgent } = payload;
+  // Agent proposals skip the owner gate the `!routine`/`!watch` commands
+  // apply at REQUEST time (Claude has no requesting user to gate), so the
+  // equivalent gate applies at APPROVAL time: only the session owner or a
+  // platform-allowlisted user may approve — a temporarily `!invite`d guest
+  // passes the reaction-router's participant check but must not be able to
+  // stand up unattended work running as the owner.
+  if (proposedByAgent && approved &&
+      decidedBy !== session.startedBy && !session.platform.isUserAllowed(decidedBy)) {
+    auditLog(session.platformId, {
+      threadId: session.threadId,
+      sessionId: session.sessionId,
+      actor: decidedBy,
+      kind: 'command',
+      tool: flavor.tool,
+      detail: `unauthorized-approval: ${parsed.name} (proposed by Claude in @${requestedBy}'s session)`,
+    });
+    const fmt = session.platform.getFormatter();
+    await withErrorHandling(
+      () => session.platform.updatePost(
+        postId,
+        `⚠️ Only ${fmt.formatUserMention(session.startedBy)} or allowed users can approve a ${flavor.tool} Claude proposed — nothing was saved.`,
+      ),
+      { action: `Update ${flavor.tool} confirmation post`, session },
+    );
+    sessionLog(session).warn(`${flavor.logPrefix} agent proposal "${parsed.name}": unauthorized approval by @${decidedBy} refused`);
+    return;
+  }
+  // The actor is the user whose REACTION decided the confirmation — the
+  // requester is carried in the detail. Matches plan approvals, which audit
+  // the reacting user; an auditor asking "who approved this unattended
+  // trigger" must get the decider.
+  auditLog(session.platformId, {
+    threadId: session.threadId,
+    sessionId: session.sessionId,
+    actor: decidedBy,
+    kind: 'command',
+    tool: flavor.tool,
+    detail: `${approved ? 'created' : 'discarded'}: ${parsed.name} (${proposedByAgent ? `proposed by Claude in @${requestedBy}'s session` : `requested by @${requestedBy}`})`,
+  });
+  session.threadLogger?.logCommand(flavor.tool, approved ? 'created' : 'discarded', decidedBy);
+  if (!approved) {
+    sessionLog(session).info(`${flavor.logPrefix} "${parsed.name}" discarded before saving`);
+    return;
+  }
+  let result: { ok: true; name: string; position: number } | { ok: false; error: string };
+  try {
+    result = await flavor.save();
+  } catch (err) {
+    result = { ok: false, error: `could not write the ${flavor.fileNoun} file (${(err as Error).message})` };
+  }
+  const formatter = session.platform.getFormatter();
+  if (result.ok) {
+    const { position, name } = result;
+    await withErrorHandling(
+      () => session.platform.updatePost(postId, flavor.savedText(formatter, position, name)),
+      { action: `Update ${flavor.tool} confirmation post`, session },
+    );
+    sessionLog(session).info(`${flavor.logPrefix} "${name}" saved by @${requestedBy}`);
+  } else {
+    const { error } = result;
+    await withErrorHandling(
+      () => session.platform.updatePost(postId, `⚠️ Could not save ${flavor.tool}: ${error}`),
+      { action: `Update ${flavor.tool} confirmation post`, session },
+    );
+    sessionLog(session).warn(`${flavor.logPrefix} save failed: ${error}`);
+  }
+}
 
 /**
  * Get postIndex map with correct mutable type.
@@ -231,6 +354,13 @@ async function cleanupSession(
   }
   keepAlive.sessionEnded();
   releaseAccountIfHeld(session, ctx);
+  // One-place rule, like releaseAccountIfHeld: every exit path must drop the
+  // worktree reference or early exits leak it and block cleanup until restart.
+  // unregisterWorktreeUser is set-based, so paths that already unregistered
+  // are unaffected.
+  if (session.worktreeInfo) {
+    ctx.ops.unregisterWorktreeUser(session.worktreeInfo.worktreePath, session.sessionId);
+  }
   await cleanupSessionUploads(session.platformId, session.threadId);
 }
 
@@ -303,22 +433,6 @@ export function handleRateLimit(session: Session, hit: RateLimitHit, ctx: Sessio
 }
 
 /**
- * Helper to find a persisted session by raw threadId.
- * Persisted sessions are keyed by composite sessionId, so we need to iterate.
- */
-function findPersistedByThreadId(
-  persisted: Map<string, PersistedSession>,
-  threadId: string
-): PersistedSession | undefined {
-  for (const session of persisted.values()) {
-    if (session.threadId === threadId) {
-      return session;
-    }
-  }
-  return undefined;
-}
-
-/**
  * Create the per-session decision bridge (plan approvals and question answers
  * flowing back through the MCP permission server — see
  * src/mcp/decision-bridge.ts). Returns null when the socket can't be created;
@@ -330,11 +444,22 @@ function findPersistedByThreadId(
  * MCP child's env) while the Session/MessageManager are created after.
  */
 async function createSessionDecisionBridge(
-  ref: { current?: Session }
+  ref: { current?: Session },
+  ctx: SessionContext
 ): Promise<DecisionBridgeServer | null> {
   try {
     return await DecisionBridgeServer.create(async (request, signal) => {
-      const messageManager = ref.current?.messageManager;
+      const session = ref.current;
+      // Agent-initiated feature actions (remember_fact, propose_routine, …)
+      // execute bot-side where the stores and their gates live — they never
+      // go through the MessageManager's decision plumbing.
+      if (request.kind === 'agent_action') {
+        if (!session) {
+          return { ok: false, reason: 'session is not ready yet' };
+        }
+        return handleAgentAction(session, ctx, request, signal);
+      }
+      const messageManager = session?.messageManager;
       if (!messageManager) {
         // Drop the connection instead of denying: a deny would be final,
         // while a dropped connection makes the MCP server fall back to its
@@ -448,54 +573,43 @@ function createMessageManager(
     // 'deny' - nothing extra to do, post already updated by MessageManager
   });
 
-  messageManager.events.on('routine-prompt:complete', async ({ approved, parsed, requestedBy, postId }) => {
-    auditLog(session.platformId, {
-      threadId: session.threadId,
-      sessionId: session.sessionId,
-      actor: requestedBy,
-      kind: 'command',
+  messageManager.events.on('routine-prompt:complete', (payload) =>
+    _handleCreationConfirmation(session, payload, {
       tool: 'routine',
-      detail: `${approved ? 'created' : 'discarded'}: ${parsed.name}`,
-    });
-    session.threadLogger?.logCommand('routine', approved ? 'created' : 'discarded', requestedBy);
-    if (!approved) {
-      sessionLog(session).info(`🕘 Routine "${parsed.name}" discarded before saving`);
-      return;
-    }
-    // The store write must not reject out of this async listener:
-    // EventEmitter never awaits listeners, so an fs error at 👍-time would
-    // become an unhandled rejection and kill the bot process. Convert it to
-    // the same visible-failure path as a validation error.
-    let result: Awaited<ReturnType<typeof ctx.state.routinesStore.add>>;
-    try {
-      result = await ctx.state.routinesStore.add(
-        session.platformId,
-        { name: parsed.name, prompt: parsed.prompt, schedule: parsed.schedule, createdBy: requestedBy },
-        ctx.config.maxRoutines,
-      );
-    } catch (err) {
-      result = { ok: false, error: `could not write the routines file (${(err as Error).message})` };
-    }
-    const formatter = session.platform.getFormatter();
-    if (result.ok) {
-      const position = ctx.state.routinesStore.list(session.platformId).length;
-      await withErrorHandling(
-        () => session.platform.updatePost(
-          postId,
-          `✅ ${formatter.formatBold(`Routine ${position}: ${result.routine.name}`)} saved — it will post its runs as new threads in this channel. ` +
-          `${formatter.formatItalic(`Manage with ${'`!routines`'}. Each run starts a full Claude session.`)}`,
-        ),
-        { action: 'Update routine confirmation post', session },
-      );
-      sessionLog(session).info(`🕘 Routine "${result.routine.name}" saved by @${requestedBy}`);
-    } else {
-      await withErrorHandling(
-        () => session.platform.updatePost(postId, `⚠️ Could not save routine: ${result.error}`),
-        { action: 'Update routine confirmation post', session },
-      );
-      sessionLog(session).warn(`🕘 Routine save failed: ${result.error}`);
-    }
-  });
+      logPrefix: '🕘 Routine',
+      fileNoun: 'routines',
+      save: async () => {
+        const result = await ctx.state.routinesStore.add(
+          session.platformId,
+          { name: payload.parsed.name, prompt: payload.parsed.prompt, schedule: payload.parsed.schedule, createdBy: payload.requestedBy, requireApproval: payload.requireApproval ?? true },
+          ctx.config.maxRoutines,
+        );
+        if (!result.ok) return result;
+        return { ok: true, name: result.routine.name, position: ctx.state.routinesStore.list(session.platformId).length };
+      },
+      savedText: (formatter, position, name) =>
+        `✅ ${formatter.formatBold(`Routine ${position}: ${name}`)} saved — it will post its runs as new threads in this channel. ` +
+        `${formatter.formatItalic(`Manage with ${'`!routines`'}. Each run starts a full Claude session.`)}`,
+    }));
+
+  messageManager.events.on('watch-prompt:complete', (payload) =>
+    _handleCreationConfirmation(session, payload, {
+      tool: 'watch',
+      logPrefix: '👁️ Watch',
+      fileNoun: 'watches',
+      save: async () => {
+        const result = await ctx.state.watchesStore.add(
+          session.platformId,
+          { name: payload.parsed.name, condition: payload.parsed.condition, prompt: payload.parsed.prompt, keywords: payload.parsed.keywords, createdBy: payload.requestedBy, requireApproval: payload.requireApproval ?? true },
+          ctx.config.maxWatches,
+        );
+        if (!result.ok) return result;
+        return { ok: true, name: result.watch.name, position: ctx.state.watchesStore.list(session.platformId).length };
+      },
+      savedText: (formatter, position, name) =>
+        `✅ ${formatter.formatBold(`Watch ${position}: ${name}`)} saved — it fires a session in the triggering thread when a matching message appears. ` +
+        `${formatter.formatItalic(`Manage with ${'`!watches`'}. Each fire starts a full Claude session.`)}`,
+    }));
 
   messageManager.events.on('context-prompt:complete', async ({ selection, queuedPrompt, queuedByUsername, queuedFiles: _queuedFiles, threadMessageCount: _threadMessageCount }) => {
     // Build message with or without context
@@ -588,251 +702,6 @@ function createMessageManager(
   return messageManager;
 }
 
-// ---------------------------------------------------------------------------
-// Out-of-band metadata suggestions (fire-and-forget)
-// ---------------------------------------------------------------------------
-
-/** Retry configuration for metadata suggestions */
-const METADATA_RETRY_DELAY_MS = 2000;
-const METADATA_MAX_RETRIES = 2;
-
-/**
- * Suggestion function types for dependency injection in tests.
- */
-export type MetadataSuggestFn = typeof suggestSessionMetadata;
-export type TagSuggestFn = typeof suggestSessionTags;
-
-/**
- * Options for attemptMetadataFetch, primarily for testing.
- */
-export interface AttemptMetadataFetchOptions {
-  /** Override the metadata suggestion function (for testing) */
-  suggestMetadata?: MetadataSuggestFn;
-  /** Override the tag suggestion function (for testing) */
-  suggestTags?: TagSuggestFn;
-}
-
-/**
- * Attempt to fetch metadata with retry logic.
- * Returns true if both metadata and tags were successfully fetched.
- *
- * @internal Exported for testing only
- */
-export async function attemptMetadataFetch(
-  session: Session,
-  prompt: string,
-  ctx: SessionContext,
-  attempt: number = 1,
-  options: AttemptMetadataFetchOptions = {}
-): Promise<{ success: boolean; metadataSet: boolean; tagsSet: boolean }> {
-  const sessionId = session.sessionId;
-
-  // Use injected functions or defaults
-  const suggestMetadataFn = options.suggestMetadata ?? suggestSessionMetadata;
-  const suggestTagsFn = options.suggestTags ?? suggestSessionTags;
-
-  // Run title/description and tags in parallel
-  const [metadata, tags] = await Promise.all([
-    suggestMetadataFn(prompt),
-    suggestTagsFn(prompt),
-  ]);
-
-  // Check if session still exists (might have been cleaned up while we awaited)
-  const currentSession = (ctx.state.sessions as Map<string, Session>).get(sessionId);
-  if (!currentSession) {
-    sessionLog(session).debug('Session gone before metadata suggestions completed');
-    return { success: false, metadataSet: false, tagsSet: false };
-  }
-
-  // Track what we successfully set
-  let metadataSet = false;
-  let tagsSet = false;
-  let updated = false;
-
-  // Only update if we got results and session doesn't already have metadata
-  if (metadata && !currentSession.sessionTitle) {
-    currentSession.sessionTitle = metadata.title;
-    currentSession.sessionDescription = metadata.description;
-    sessionLog(currentSession).debug(`Set title: "${metadata.title}" (attempt ${attempt})`);
-    metadataSet = true;
-    updated = true;
-  } else if (currentSession.sessionTitle) {
-    // Already has title from a previous attempt
-    metadataSet = true;
-  }
-
-  if (tags.length > 0 && (!currentSession.sessionTags || currentSession.sessionTags.length === 0)) {
-    currentSession.sessionTags = tags;
-    sessionLog(currentSession).debug(`Set tags: ${tags.join(', ')} (attempt ${attempt})`);
-    tagsSet = true;
-    updated = true;
-  } else if (currentSession.sessionTags && currentSession.sessionTags.length > 0) {
-    // Already has tags from a previous attempt
-    tagsSet = true;
-  }
-
-  // Update persistence and UI if anything changed
-  if (updated) {
-    ctx.ops.persistSession(currentSession);
-    await ctx.ops.updateStickyMessage();
-    await ctx.ops.updateSessionHeader(currentSession);
-  }
-
-  return { success: metadataSet && tagsSet, metadataSet, tagsSet };
-}
-
-/**
- * Fire metadata suggestions (title, description, tags) in the background.
- * This is fire-and-forget - it never blocks session startup and never throws.
- *
- * Includes retry logic: if metadata or tags fail to fetch, retries up to
- * METADATA_MAX_RETRIES times with METADATA_RETRY_DELAY_MS delay between attempts.
- *
- * @param session - The session to update
- * @param prompt - The user's initial prompt
- * @param ctx - Session context for persistence and UI updates
- */
-function fireMetadataSuggestions(
-  session: Session,
-  prompt: string,
-  ctx: SessionContext
-): void {
-  // Fire immediately without awaiting
-  void (async () => {
-    try {
-      // First attempt
-      let result = await attemptMetadataFetch(session, prompt, ctx, 1);
-
-      // Retry if either metadata or tags failed
-      let attempt = 1;
-      while (!result.success && attempt < METADATA_MAX_RETRIES + 1) {
-        attempt++;
-
-        // Check if session still exists before retrying
-        const currentSession = (ctx.state.sessions as Map<string, Session>).get(session.sessionId);
-        if (!currentSession) {
-          sessionLog(session).debug('Session gone, stopping metadata retries');
-          return;
-        }
-
-        // Log what we're retrying for
-        const missing: string[] = [];
-        if (!result.metadataSet) missing.push('title/description');
-        if (!result.tagsSet) missing.push('tags');
-        sessionLog(session).debug(`Retrying metadata fetch for ${missing.join(', ')} (attempt ${attempt}/${METADATA_MAX_RETRIES + 1})`);
-
-        // Wait before retrying
-        await new Promise(resolve => setTimeout(resolve, METADATA_RETRY_DELAY_MS));
-
-        // Retry
-        result = await attemptMetadataFetch(session, prompt, ctx, attempt);
-      }
-
-      if (!result.success) {
-        const missing: string[] = [];
-        if (!result.metadataSet) missing.push('title/description');
-        if (!result.tagsSet) missing.push('tags');
-        sessionLog(session).debug(`Metadata fetch incomplete after ${attempt} attempts: missing ${missing.join(', ')}`);
-      }
-    } catch (err) {
-      // Fire-and-forget: log but never throw
-      sessionLog(session).debug(`Metadata suggestion error: ${err}`);
-    }
-  })();
-}
-
-/**
- * Fire periodic re-classification if session focus might have shifted.
- * Called periodically (every N messages) to update title/tags.
- * This is fire-and-forget - it never blocks and never throws.
- *
- * Uses structured context with original task as anchor to prevent
- * title thrashing from minor conversation variations.
- *
- * @param session - The session to potentially re-classify
- * @param currentMessage - The latest user message (used for context)
- * @param ctx - Session context for persistence and UI updates
- */
-function firePeriodicReclassification(
-  session: Session,
-  currentMessage: string,
-  ctx: SessionContext
-): void {
-  // Fire immediately without awaiting
-  void (async () => {
-    try {
-      const sessionId = session.sessionId;
-
-      // Use structured context for stability:
-      // - Original task is PRIMARY (anchor for title)
-      // - Recent message is SECONDARY (only matters if focus fundamentally changed)
-      // - Current title helps LLM maintain stability
-      const titleContext = session.firstPrompt
-        ? {
-            originalTask: session.firstPrompt,
-            recentContext: currentMessage,
-            currentTitle: session.sessionTitle,
-          }
-        : currentMessage;  // Fallback to simple string if no firstPrompt
-
-      // For tags, still use combined context (tags are less sensitive to thrashing)
-      const tagContext = session.firstPrompt
-        ? `Original task: ${session.firstPrompt}\n\nRecent activity: ${currentMessage}`
-        : currentMessage;
-
-      // Run title/description and tags in parallel
-      const [metadata, tags] = await Promise.all([
-        suggestSessionMetadata(titleContext),
-        suggestSessionTags(tagContext),
-      ]);
-
-      // Check if session still exists
-      const currentSession = (ctx.state.sessions as Map<string, Session>).get(sessionId);
-      if (!currentSession) {
-        sessionLog(session).debug('Session gone before reclassification completed');
-        return;
-      }
-
-      // Update metadata if we got valid results
-      // Note: With structured context, the LLM is instructed to prefer keeping
-      // the current title unless there's a fundamental focus shift
-      let updated = false;
-
-      if (metadata) {
-        // Only update if title actually changed (LLM may return same title for stability)
-        if (metadata.title !== currentSession.sessionTitle) {
-          currentSession.sessionTitle = metadata.title;
-          currentSession.sessionDescription = metadata.description;
-          sessionLog(currentSession).debug(`Updated title: "${metadata.title}"`);
-          updated = true;
-        } else {
-          sessionLog(currentSession).debug('Title unchanged (stable)');
-        }
-      }
-
-      if (tags.length > 0) {
-        currentSession.sessionTags = tags;
-        sessionLog(currentSession).debug(`Updated tags: ${tags.join(', ')}`);
-        updated = true;
-      }
-
-      // Update persistence and UI if anything changed
-      if (updated) {
-        ctx.ops.persistSession(currentSession);
-        await ctx.ops.updateStickyMessage();
-        await ctx.ops.updateSessionHeader(currentSession);
-      }
-    } catch (err) {
-      // Fire-and-forget: log but never throw
-      sessionLog(session).debug(`Reclassification error: ${err}`);
-    }
-  })();
-}
-
-// ---------------------------------------------------------------------------
-// System prompt for chat platform context
-// ---------------------------------------------------------------------------
-
 /**
  * System prompt that gives Claude context about running in a chat platform.
  * This is appended to Claude's system prompt via --append-system-prompt.
@@ -841,33 +710,6 @@ function firePeriodicReclassification(
  * Edit the registry to update this prompt - do not edit this constant directly.
  */
 export const CHAT_PLATFORM_PROMPT = generateChatPlatformPrompt();
-
-/**
- * How often to fire periodic reclassification (every N messages).
- */
-const RECLASSIFICATION_INTERVAL = 5;
-
-/**
- * Check if periodic reclassification should be triggered for this message.
- * Fires out-of-band re-classification of title/tags at regular intervals.
- * Always returns the original message unchanged (no longer injects reminders
- * since we now handle metadata out-of-band via quickQuery).
- */
-export function maybeInjectMetadataReminder(
-  message: string,
-  session: { messageCount: number },
-  ctx?: SessionContext,
-  fullSession?: Session
-): string {
-  // Fire out-of-band re-classification periodically
-  if (session.messageCount > 1 && session.messageCount % RECLASSIFICATION_INTERVAL === 0) {
-    if (ctx && fullSession) {
-      firePeriodicReclassification(fullSession, message, ctx);
-    }
-  }
-  // Always return the message unchanged
-  return message;
-}
 
 // ---------------------------------------------------------------------------
 // Session creation
@@ -941,7 +783,7 @@ export function resolveSessionHeaderMode(
  *                           When starting mid-thread, this is the @mention message, not the thread root.
  */
 export async function startSession(
-  options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean },
+  options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean; autoIncludeContext?: boolean; unattended?: boolean },
   username: string,
   displayName: string | undefined,
   replyToPostId: string | undefined,
@@ -950,7 +792,7 @@ export async function startSession(
   triggeringPostId?: string,
   initialOptions?: InitialSessionOptions
 ): Promise<void> {
-  const sessionKey = `${platformId}:${replyToPostId || ''}`;
+  const sessionKey = compositeSessionId(platformId, replyToPostId || '');
 
   // A start for this exact session key is already in flight: wait for it and
   // deliver this message as a follow-up instead of spawning a second Claude.
@@ -980,7 +822,7 @@ export async function startSession(
 }
 
 async function startSessionImpl(
-  options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean },
+  options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean; autoIncludeContext?: boolean; unattended?: boolean },
   username: string,
   displayName: string | undefined,
   replyToPostId: string | undefined,
@@ -1204,7 +1046,7 @@ async function startSessionImpl(
   // the session's MessageManager exists — the handler dereferences it lazily
   // through the ref box (the Session object itself is created further down).
   const bridgeSessionRef: { current?: Session } = {};
-  const decisionBridge = await createSessionDecisionBridge(bridgeSessionRef);
+  const decisionBridge = await createSessionDecisionBridge(bridgeSessionRef, ctx);
 
   const cliOptions: ClaudeCliOptions = {
     workingDir,
@@ -1229,6 +1071,10 @@ async function startSessionImpl(
     memory: await resolveSessionMemory(
       ctx.state.memoryStore, memoryConfig, platformId, workingDir,
     ),
+    agentFeatures: sessionAgentFeatures(
+      { platformId, threadId: actualThreadId, unattended: options.unattended },
+      ctx.ops,
+    ),
   };
   let claude: ClaudeCli;
   try {
@@ -1247,6 +1093,7 @@ async function startSessionImpl(
     platform,
     claudeSessionId,
     claudeAccountId: claudeAccount?.id,
+    unattended: options.unattended || undefined,
     startedBy: username,
     startedByDisplayName: displayName,
     startedAt: new Date(),
@@ -1352,7 +1199,12 @@ async function startSessionImpl(
 
   // Check if we should prompt for worktree
   // Skip if explicitly disabled (e.g., when branch was specified in initial message via !worktree)
-  const shouldPrompt = options.skipWorktreePrompt ? null : await ctx.ops.shouldPromptForWorktree(session);
+  // Always run the check — it also detects (and records) an existing worktree
+  // around workingDir. skipWorktreePrompt suppresses only the prompt itself,
+  // otherwise unattended starts inside a worktree would miss worktreeInfo and
+  // its reference-count protection.
+  const worktreePromptReason = await ctx.ops.shouldPromptForWorktree(session);
+  const shouldPrompt = options.skipWorktreePrompt ? null : worktreePromptReason;
   if (shouldPrompt) {
     session.queuedPrompt = options.prompt;
     session.queuedByUsername = username;   // owner — used when the worktree prompt later re-sends
@@ -1362,6 +1214,14 @@ async function startSessionImpl(
     ctx.ops.persistSession(session);
     await ctx.ops.updateStickyMessage();
     return;
+  }
+
+  // shouldPromptForWorktree may have detected that workingDir already IS a
+  // worktree and recorded it on the session; register it for reference
+  // counting like every other path that sets worktreeInfo, or another
+  // session's cleanup can remove the directory under this live session.
+  if (session.worktreeInfo) {
+    ctx.ops.registerWorktreeUser(session.worktreeInfo.worktreePath, session.sessionId);
   }
 
   // Build message content
@@ -1388,8 +1248,13 @@ async function startSessionImpl(
   // post — there is no thread history to offer, so skip the context prompt
   // and take the plain send path below.
   if (replyToPostId && !isDcmThreadId(replyToPostId)) {
-    const excludePostId = triggeringPostId || replyToPostId;
-    await ctx.ops.offerContextPrompt(session, messageText, options.files, excludePostId, username);
+    // Human starts exclude the @mention message (its content already IS the
+    // prompt). Unattended autoIncludeContext starts (watch fires) exclude
+    // nothing: their prompt is synthetic and the triggering message is the
+    // event the session must see — excluding the thread root here previously
+    // fired "triage the incident" sessions that never saw the incident.
+    const excludePostId = options.autoIncludeContext ? undefined : (triggeringPostId || replyToPostId);
+    await ctx.ops.offerContextPrompt(session, messageText, options.files, excludePostId, username, options.autoIncludeContext);
     // Either path inside offerContextPrompt sends or queues. Surface any
     // skipped-file warnings and return — the fallback claude.sendMessage()
     // below would be a duplicate.
@@ -1428,7 +1293,7 @@ export async function resumeSession(
   // is nothing to do — resumePausedSession delivers its message through the
   // registered session afterwards.
   if (state.threadId && state.platformId) {
-    const sessionKey = `${state.platformId}:${state.threadId}`;
+    const sessionKey = compositeSessionId(state.platformId, state.threadId);
     // Defensive: some callers (and tests) construct minimal contexts — the
     // guard is an optimization, resumeSessionImpl revalidates everything.
     const sessions = ctx.state?.sessions as Map<string, Session> | undefined;
@@ -1543,7 +1408,7 @@ async function resumeSessionImpl(
   // participants (owner + invited) instead of the whole platform allowlist.
   if (resolveApprovals(platform.approvals, isDcmThreadId(state.threadId)) === 'owner') {
     platformMcpConfig.allowedUsers = Array.from(
-      new Set(state.sessionAllowedUsers || [state.startedBy].filter(Boolean))
+      sessionAllowedUserSet(state)
     ) as string[];
   }
 
@@ -1556,7 +1421,7 @@ async function resumeSessionImpl(
     state.workingDir,
     state.threadId,
     state.startedBy,
-    state.sessionAllowedUsers || [state.startedBy],
+    [...sessionAllowedUserSet(state)],
     CHAT_PLATFORM_PROMPT,
     ctx.state.githubEmailsStore,
     memoryConfig.enabled && memoryConfig.channelLayer ? ctx.state.memoryStore : null,
@@ -1579,7 +1444,7 @@ async function resumeSessionImpl(
 
   // Decision bridge for the resumed session (see startSession for rationale)
   const resumeBridgeRef: { current?: Session } = {};
-  const resumeBridge = await createSessionDecisionBridge(resumeBridgeRef);
+  const resumeBridge = await createSessionDecisionBridge(resumeBridgeRef, ctx);
 
   const cliOptions: ClaudeCliOptions = {
     workingDir: state.workingDir,
@@ -1605,6 +1470,10 @@ async function resumeSessionImpl(
       ctx.state.memoryStore, memoryConfig, state.platformId, state.workingDir,
       activeWorktreeRepoRoot(state.workingDir, state.worktreeInfo),
     ),
+    agentFeatures: sessionAgentFeatures(
+      { platformId: state.platformId, threadId: state.threadId, unattended: _resumedUnattended(state) },
+      ctx.ops,
+    ),
   };
   let claude: ClaudeCli;
   try {
@@ -1623,6 +1492,7 @@ async function resumeSessionImpl(
     platform,
     claudeSessionId: state.claudeSessionId,
     claudeAccountId: claudeAccount?.id,
+    unattended: _resumedUnattended(state) || undefined,
     startedBy: state.startedBy,
     startedByDisplayName: state.startedByDisplayName,
     startedAt: new Date(state.startedAt),
@@ -1631,7 +1501,7 @@ async function resumeSessionImpl(
     workingDir: state.workingDir,
     claude,
     planApproved: state.planApproved ?? false,
-    sessionAllowedUsers: new Set(state.sessionAllowedUsers || [state.startedBy].filter(Boolean)),
+    sessionAllowedUsers: sessionAllowedUserSet(state),
     forceInteractivePermissions: state.forceInteractivePermissions ?? false,
     respondOnlyWhenMentioned: state.respondOnlyWhenMentioned ?? false,
     userAttribution,
@@ -1922,13 +1792,32 @@ export async function resumePausedSession(
   message: string,
   files: PlatformFile[] | undefined,
   ctx: SessionContext,
-  username: string
+  username: string,
+  platformId: string
 ): Promise<void> {
-  // Find persisted session by raw threadId
-  const persisted = ctx.state.sessionStore.load();
-  const state = findPersistedByThreadId(persisted, threadId);
+  // Find persisted session by raw threadId, scoped to the message's platform.
+  //
+  // This MUST use the same any-state lookup the paused-session gate in
+  // message-handler uses (`registry.getPersistedByThreadId`), not `load()`.
+  // `load()` skips soft-deleted records; the gate does not. When the two
+  // disagreed, a soft-deleted record routed every message into the paused
+  // branch and then died here on "No persisted session found" — and because
+  // the paused branch owns the message, the new-session path never ran
+  // either. The thread was unreachable in both directions.
+  //
+  // In direct channel mode, where the channel IS the session, that made the
+  // whole channel permanently deaf the moment `!stop` soft-deleted its record.
+  const state = ctx.state.sessionStore.findByThreadIdAnyState(threadId, platformId);
   if (!state) {
     log.debug(`No persisted session found for ${threadId.substring(0, 8)}...`);
+    return;
+  }
+
+  // The gate upstream already hides stopped records, but this is a public sink
+  // and the rule belongs where the resurrection actually happens. Any-state
+  // means any state — including one whose conversation is over.
+  if (!isRevivable(state)) {
+    log.debug(`Not resuming stopped session ${threadId.substring(0, 8)}... — it ended`);
     return;
   }
 
@@ -1944,18 +1833,47 @@ export async function resumePausedSession(
     log.warn(`auth.denied.resume: platform '${state.platformId}' not found for ${shortId}...`);
     return;
   }
-  const sessionAllowedUsers = new Set(state.sessionAllowedUsers || [state.startedBy].filter(Boolean));
+  const sessionAllowedUsers = sessionAllowedUserSet(state);
   if (!isAuthorizedForSession({ username, platform, sessionAllowedUsers })) {
     log.warn(`auth.denied.resume: @${username || 'unknown'} not authorized to resume ${shortId}...`);
     return;
   }
+  // A record we are about to revive must stop being a tombstone, or `load()`
+  // hides it again and the thread is trapped on the next lookup that uses it.
+  // Clearing it here — after the authorization gate, so a refused resume
+  // cannot launder a soft-deleted session back into the visible set — makes
+  // the revival stick.
+  if (state.cleanedAt) {
+    log.info(`🪦 Reviving soft-deleted session ${shortId}... (resumed by @${username})`);
+    delete state.cleanedAt;
+    // Both fields, or the record carries a reason for an ending that no longer
+    // happened. `resolveEndReason` reads it as undefined without `cleanedAt`,
+    // so this is hygiene rather than a bug — but the pair is written together
+    // and has to be cleared together, or the next reader has to know that.
+    delete state.endReason;
+    // Written back here rather than left to the resume's own persistence: the
+    // tombstone has to be off DISK, not just off this object, or a restart
+    // before the next save puts the thread straight back in the trap.
+    ctx.state.sessionStore.save(compositeSessionId(state.platformId, state.threadId), state);
+  }
+
   log.info(`🔄 Resuming paused session ${shortId}... for new message`);
 
   // Resume the session
   await resumeSession(state, ctx, username);
 
-  // Wait a moment for the session to be ready, then send the message
-  const session = ctx.ops.findSessionByThreadId(threadId);
+  // Wait a moment for the session to be ready, then send the message.
+  //
+  // Resolved by COMPOSITE key, not by raw thread id. `findSessionByThreadId`
+  // scans every platform and returns the first match, so if another platform
+  // already had a live session under the same raw thread id, this message and
+  // its attachments would be handed to that session's messageManager —
+  // straight past its authorization gate. platformId is the store's hard
+  // privacy boundary; the lookup that delivers the message has to honour it
+  // too, not just the one that finds the record.
+  const session = (ctx.state.sessions as Map<string, Session>).get(
+    compositeSessionId(state.platformId, state.threadId)
+  );
   if (session && session.claude.isRunning() && session.messageManager) {
     // Increment message counter and delegate to MessageManager
     session.messageCount++;
@@ -2178,8 +2096,10 @@ export async function handleExit(
     ctx.ops.unregisterWorktreeUser(session.worktreeInfo.worktreePath, session.sessionId);
   }
 
-  // Clean up session from maps and notify keep-alive
-  removeFromRegistry(session, ctx, code === 0 ? 'exit' : `exit:${code}`);
+  // Clean up session from maps and notify keep-alive. A signal death
+  // (code null) is a clean end like code 0 — matching closeThreadLogger and
+  // the unpersist branch below, so no path can label it 'exit:null'.
+  removeFromRegistry(session, ctx, code === 0 || code === null ? 'exit' : `exit:${code}`);
 
   // Only unpersist for normal exits
   if (code === 0 || code === null) {

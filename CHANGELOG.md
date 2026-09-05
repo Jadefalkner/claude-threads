@@ -7,6 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.1] - 2026-09-05
+
+### Fixed
+- **A `!stop` in a direct-channel-mode channel no longer makes it permanently deaf** (#538, thanks @kaza). The paused-session gate and the resume sink disagreed about soft-deleted sessions, so a tombstoned record claimed every message and dropped it. Tombstones now carry an end reason: a user-stopped session stays ended (the next message starts a fresh session), while a stale-swept one is revived — honoring the "send a new message to continue" promise — with the tombstone cleared only after the resume authorization gate. Also closes the reaction-resume door on stopped sessions, and `!help` now answers in a paused thread instead of vanishing. Fixes #537.
+- **Direct-channel-mode sessions are no longer tombstoned by the boot-time stale sweep** (#530, thanks @kaza). One quiet hour used to brick the channel silently. Fixes #499.
+- **Pooled accounts selected by `home` now clear inherited `CLAUDE_CONFIG_DIR`** (#540, thanks @kaza), which outranks the `HOME` override — a daemon started under its own profile silently billed every pooled session to its own seat and probed its own quota per pool entry. Also clears `CLAUDE_SECURESTORAGE_CONFIG_DIR` and inherited bearer credentials; API-key and single-account modes unaffected. Fixes both session spawning and the usage probe. Fixes #539.
+
+## [1.33.0] - 2026-09-02
+
+### Security
+- **fast-uri floored at 4.1.4** (transitive via `ajv`), clearing four fresh high-severity advisories (host confusion and SSRF classes, GHSA-5jgf-p345-68v8 and siblings). Override floor raised from `>=4.1.2`; no direct dependency changes.
+
+### Added
+- **Slack: posts made through the app's own user token count as the person's message** (#527, thanks @kaza). Tooling that posts into the channel via the app's user token (same `app_id` + team, acting user set) previously looked bot-authored and was ignored; such posts now command the bot as the acting user. Authorship is decided only from server-authoritative envelope identity (`app_id` learned from the `hello` frame and per-envelope `api_app_id`) — content-based spoofing cannot trigger it, and events that don't match fail closed to today's behavior. Closes #526.
+
+## [1.32.1] - 2026-09-02
+
+### Changed
+- **Dependency updates.** Production: hono 4.13.5, zod 4.5.4, js-yaml 4.3.2, express-rate-limit 8.7.0 (#522); dev-dependency group refreshed (#521). Validated with the full unit and Slack integration suites.
+
+## [1.32.0] - 2026-09-01
+
+### Added
+- **Slack: shared event source — one Socket Mode connection per app** (#502, thanks @kaza). Slack round-robins Socket Mode envelopes across all of an app's open connections, so a second `SlackClient` on the same app token silently steals events from the first. Now exactly one client (the parent) owns the socket; other clients register as secondaries and receive their channels' events injected by the parent — Web API calls stay independent per instance. The parent mirrors connection state onto secondaries (idempotently re-armed across disconnects), and on reconnect, missed-message recovery runs for the parent and every registered secondary. Zero behavior change for existing single-channel configs; this is the mechanism that unblocks DM auto-discovery on Slack and other multi-channel consumers.
+
+## [1.31.2] - 2026-08-30
+
+### Added
+- **The approval posture of a routine or watch is now visible and changeable after creation.** `!routines` / `!watches` listings show each item's posture inline (👍 approvals · ✅ autonomous), and a new owner-gated `!routines approval <n> on|off` / `!watches approval <n> on|off` flips it — `off` makes an item run autonomously, `on` restores per-action approval. Turning a watch autonomous is the same sensitive choice the creation card gates behind the owner and an explicit ✅, so the flip command is owner-gated too; the safe approvals-required posture stays the default for older data.
+
+### Security
+- **Active-session thread-id lookups are now scoped by `platformId`**, completing the cross-platform privacy boundary that 1.31.0/1.31.1 established for the persisted store. `SessionRegistry.findByThreadId` takes an optional `platformId` and resolves O(1) against the composite key when given; the message router (`handleMessage`) and the in-session authorization check (`isUserAllowedInSession`) now pass it, so a thread id that collides across platforms can no longer resolve to — or authorize a user against — another platform's *active* session, and the router and auth check always agree on which session a message belongs to. Defense-in-depth: real Mattermost (26-char) and Slack (dotted-ts) ids don't collide today.
+
+## [1.31.1] - 2026-08-29
+
+### Security
+- **Regression guard for the cross-platform resume scoping (1.31.0).** The `resumePausedSession` sink is now covered by a test that fails if the `platformId` scope is removed — a message on one platform must never resume a session persisted under another platform whose thread id collides. The fix shipped correct in 1.31.0 but without this guard.
+
+### Fixed
+- **A rejected branch name can no longer break its own error message.** An invalid `!worktree <name>` whose name contains a backtick or newline is sanitized for display, so it stays inside its markdown code span in the error post.
+- **A downgraded "✅ Invite to session" reaction is no longer silent.** When a non-owner participant's ✅ is downgraded to a one-shot allow (only the owner may grant standing membership), the bot now says so, instead of leaving the reactor to assume the invite succeeded.
+
+## [1.31.0] - 2026-08-29
+
+### Added
+- **Watches and routines now carry an explicit approval posture, chosen at creation.** The confirmation card offers 👍 *save* (each fired run asks for in-thread approval before every tool action) or ✅ *save + run autonomously* (no approval prompts) alongside 👎 *discard*. The choice is persisted per item (`requireApproval`) and enforced at fire time: an approval-required fire runs with interactive permissions even on a `skipPermissions` platform, so a watch triggered by attacker-influenceable channel content cannot silently execute tools with no human in the loop. The safe posture is the default — existing watches/routines and agent-proposed items always require approval (the autonomous option is never offered for agent proposals). Choosing the autonomous posture is owner-gated: a non-owner participant's ✅ is downgraded to approvals-required.
+
+### Security
+- **End-of-session distillation now skips unattended (routine/watch-fired) sessions**, matching the existing `remember_fact` guard. A prompt-injected fire could otherwise persist attacker-derived "facts" from its (attacker-seeded) thread into channel memory, which is injected into every future session's system prompt.
+- **The "✅ Invite to session" reaction is now owner-gated**, closing an asymmetry with the owner-gated `!invite` command: a temporarily-`!invite`d guest could previously grant *standing* session membership to an unauthorized third party by reacting on their message-approval card. A non-owner's ✅ is now downgraded to a one-shot allow (the message still passes once; no membership is granted).
+- **Worktree branch names are validated at the `createAndSwitchToWorktree` chokepoint**, not only on the interactive prompt path — the in-session `!worktree <name>` command reached `git worktree add` with an unvalidated name. `isValidBranchName` now also rejects shell metacharacters (`& | ; $ \` ( ) < > ! ' " # %`), which git permits in ref names but which become a command-injection vector on Windows (where the spawn wrapper runs git with `shell:true`); `git worktree add` calls gained a `--` separator as defense-in-depth against flag injection.
+- **Session-store threadId lookups no longer cross the platform boundary.** Every resume/lookup path — the plain-reply resume (`resumePausedSession`), `isUserAllowedInSession`, `hasPausedSession`/`getPersistedSession`/`cancelPausedSession` and `getSessionStartPostId` — now scopes by the message's `platformId`, so a thread id that collides across platforms can no longer resume another platform's session (its allowlist, working dir, worktree and Claude account) or authorize a user against another platform's allowlist.
+- **The author identity in watch confirm/fire prompts is collapsed to a single line** before interpolation, so a future platform's free-form display name cannot smuggle newlines or fake delimiters outside the quoted message block.
+- **`update-state.json` is written owner-only (0600)** via the shared atomic writer, matching every other on-disk store (it previously defaulted to 0644).
+- **Persisted free-text fields (`firstPrompt`, `queuedPrompt`, `lastTasksContent`) are capped** before entering `sessions.json`, so a single pathological message can no longer inflate the whole file (rewritten on every mutation). The cap is far above any real prompt.
+
+## [1.30.2] - 2026-08-29
+
+### Changed
+- **Latest verified Claude CLI: 2.1.251** (from 2.1.226). The full verification battery ran against it: all 17 reference event streams re-captured (`tests/integration/fixtures/real-cli-captures/`), structural dialect diff against the 2.1.226 captures, and the decision-bridge e2e. Dialect drift found and verified benign: a new top-level `autocompact_state` event and a new `system/task_summary` subtype (both ignored by the bot), and the post-compact `user` echo events are no longer emitted (the bot never consumed them). Deployments on current CLIs no longer show the "⚠️ untested" warning.
+
+## [1.30.1] - 2026-08-28
+
+### Security
+- **The card-injection guard now also covers the haiku-parsed `!watch`/`!routine` paths and the store-level gates.** 1.30.0 collapsed watch *keywords*; model-authored names, conditions and prompts from the natural-language parsers — and the stores' own name/condition normalization, the gate no caller can bypass — now go through the same shared `singleLine` helper (`utils/format.ts`), which replaces the two inline copies of the whitespace-collapse regex.
+
+## [1.30.0] - 2026-08-28
+
+### Added
+- **Agent tools — Claude can now use the bot's own features from inside a session.** Six new MCP tools, executed in the bot process over the session's decision bridge:
+  - `remember_fact` saves one durable team fact to channel memory with a new `agent` provenance label. No approval prompt (the end-of-session distiller already writes ungated) — instead every save is **announced in the thread**, audit-logged, capped at 5 per session, and can never displace a user-written entry (supersede/dedupe/eviction rank agent entries with distilled ones). `list_memory` lists what's stored.
+  - `propose_routine` / `propose_watch` post the **existing confirmation card** (badged "Claude proposes…") and save **nothing** — only a human 👍 persists the routine/watch, which is then owned by the session owner like a hand-typed one. `list_routines` / `list_watches` are read-only.
+  - **Loop prevention:** sessions started by routine/watch fires are marked `unattended` (persisted across restarts); such sessions cannot propose new routines or watches **or write channel memory** — the tools aren't offered there, and the bot refuses regardless (a prompt-injected fire must not seed future sessions' context).
+  - **Approval is owner-gated for agent proposals:** an `!invite`d guest can react on the card, but only the session owner or a platform-allowlisted user may decide it — an unauthorized reaction is refused *without consuming the proposal* (and warned about once, not per toggle), so a guest can neither approve nor veto. Card text Claude authors is collapsed to a single line so it cannot restyle the approval card, and a proposal never displaces a pending human confirmation.
+  - Tool availability follows the platform's `memory`/`routines`/`watches` config (advisory env gates on the MCP child; authoritative re-checks in the bot). Destructive operations (forget, pause, delete, manual run) are never exposed to Claude.
+
+### Fixed
+- **Bot-to-bot loops are broken at every link (#491).** Two claude-threads bots on one server could lock into an unbounded refusal loop (observed in the wild: 1,941 messages in 37 minutes) because the "not authorized to resume" refusal @-mentioned the bot it was refusing. Three independent fixes, any one of which stops that incident: refusals render the refused user as inline code instead of an @-mention (reads the same, notifies nobody); refusals are rate-limited to once per (thread, user) per 5 minutes instead of once per message; and claude-threads now recognizes another instance's own status posts (refusals, timeout/idle notices, cancellations, emergency shutdowns, resume announcements) and never treats them as a request — even when they carry a mention. A human message that merely starts with one of the status emojis still gets through. Thanks to @theprsi for the excellent incident analysis.
+- A signal death of the Claude process (exit code `null`) can no longer be labeled `exit:null` on the registry-removal path — it's a clean end like code 0, matching every sibling teardown site. (Independently found by @Jadefalkner.)
+
+### Security
+- **Watch prefilter keywords are collapsed to single-line** before rendering into the human-approval card — an embedded newline could otherwise smuggle multi-line markdown past the card's single-line guard (second-pass review follow-up to the agent tools).
+- **The decision bridge drops connections that stream more than 1MB without a newline** instead of buffering indefinitely — closes the cheapest local memory-exhaustion path against the bot process.
+- The single-line sanitizers (memory entries, agent card text, watch keywords) now also collapse U+0085 (NEL), which JS `\s` does not cover.
+
+## [1.29.3] - 2026-08-28
+
+Re-release of 1.29.2 — no code changes. The 1.29.2 npm publish failed the same
+way as 1.29.1 (npm masked-auth E404): the NPM_TOKEN repository secret had
+expired. The token has been rotated and this version ships what 1.29.2 was
+meant to ship, plus the release.yml retry fix (#496).
+
+## [1.29.2] - 2026-08-24
+
+Re-release of 1.29.1 — no code changes. The 1.29.1 npm publish step failed
+(the registry rejected the publish with npm's masked-auth E404); the v1.29.1
+tag and GitHub release exist, but the package never reached npm. This version
+re-runs the publish.
+
+## [1.29.1] - 2026-08-24
+
+### Fixed
+- **DCM: a channel message addressed to another user no longer starts a session.** With no session running, `@bob did you deploy?` in a direct-channel-mode channel used to start a full Claude session in a human-to-human exchange — the side-conversation guard the active/paused paths already had now covers the new-session path too.
+- **The side-conversation guard now works on Slack.** Slack delivers mentions as raw `<@U0…>` tokens (labeled `<@U0…|name>` included), never `@name`, so the guard (active sessions, paused sessions, and the new DCM path) silently never matched there — every human-to-human aside in a session thread was fed to Claude as a follow-up. A message that *also* @mentions the bot still reaches Claude (it explicitly asks the bot), and on Mattermost a literal `<@…>` token stays ordinary text.
+- **DCM: non-allowlisted members no longer trigger an unauthorized-warning post per message.** The warning now only fires on an explicit @mention — previously every message from a non-allowlisted member produced channel spam, and two bots could warn at each other in a loop on Mattermost.
+- **`!watches` works in direct channel mode again** — only *creation* is refused there; watches that predate a switch to DCM stay listable/pausable/deletable (matches routines).
+- **Slack thread history keeps the newest messages for arbitrarily long threads** — the pagination walk now retains a sliding window instead of stopping after 10 pages with the oldest content, and the truncation warning is honest about what was dropped.
+- **Audit trail: routine/watch creation confirmations now record the user whose reaction decided them** (the requester is carried in the detail) — matching how plan approvals are attributed.
+- **sessions.json and the GitHub-emails store can no longer be wiped by a transient read failure.** Every mutation is a read-modify-write; when the existing file cannot be read faithfully (corruption, EMFILE), reads degrade to empty but writes now refuse — previously the next persist atomically replaced the file with the degraded empty view, destroying every paused session across all platforms. A parseable file that merely lacks the collection key (e.g. a bare `{}`) provably holds nothing and stays writable — as does a zero-length or whitespace-only file, so a crashed first write can never leave a store permanently read-only.
+- Mattermost thread history resolves usernames only for the messages the limit keeps (matches the Slack client).
+- **Slack MCP tools now normalize literal Unicode emoji to shortcodes** for `react_to_post` and interactive-post reactions — `reactions.add` rejects raw 👍; the client path already normalized, the MCP path was the odd one out.
+- **Worktree commands honor `approvals: owner`.** `!worktree` create/switch/remove/cleanup and worktree-prompt disabling now go through the same owner gate as every other owner-gated command: under owner-scoped approvals a platform-allowlisted non-participant could previously switch the session's working directory.
+- **All haiku one-shots (routine/watch parses, watch confirms, memory distillation) now resolve the claude binary like sessions do** — `quickQuery` used a bare `claude` from PATH while sessions fall back to common install locations, so on some hosts sessions worked while every one-shot silently failed.
+
+### Changed
+- Internal restructuring after three feature waves: the user-commands module splits by domain (guards/memory/automation), lifecycle sheds the out-of-band metadata-suggestions domain into its own module, and the last two stores (sessions, GitHub emails) migrate onto the shared atomic-write primitives.
+- A wide DRY + dead-code sweep (net −800 lines): shared WebSocket close/permalink formatting/post-list rendering/limit clamping across the platform and MCP layers, one canonical legacy-allowlist helper for the six hand-copied authorization fallbacks, nine MCP tool registrations collapsed into one helper, ~380 lines of dead test helpers deleted, and the client test files adopt the shared fetch harness.
+
+## [1.29.0] - 2026-08-24
+
+### Added
+- **Watches — event triggers, the proactive counterpart to routines.** `!watch when someone reports a production incident, triage it and post a checklist` creates a watch in natural language: one haiku pass extracts the matching condition, the task, and a set of prefilter keywords (synonyms and both languages for non-English requests), the bot shows all three, and **nothing is saved until someone reacts 👍**. When a matching message appears in the channel, the bot starts a full Claude session **in the triggering message's own thread**, running as the watch's creator with the thread's recent messages auto-included as context.
+  - **Two-stage matching keeps chatty channels free:** a zero-cost local keyword prefilter screens every message; only prefilter hits get one haiku call that semantically confirms the match. A keyword hit alone never fires, and a failed confirmation never fires (fail-closed).
+  - **Managing:** `!watches` lists numbered with condition/creator/last-fire; `!watches pause|resume|delete <n>` (owner-gated). No manual run — watches are event-driven.
+  - **Guardrails:** per-watch cooldown (`limits.watchCooldownMinutes`, default 5) and daily fire cap (`limits.watchDailyCap`, default 20); per-platform cap (`limits.maxWatches`, default 10); at most one watch fires per message; 3 consecutive failed fires auto-disable with a notice; a deauthorized creator disables the watch; session threads and bot posts can never re-trigger (loop prevention); fires count against `MAX_SESSIONS`. Per-platform `watches: false` disables the feature; storage at `~/.config/claude-threads/watches.yaml` (0600, per-platform scoped like memory; override `CLAUDE_THREADS_WATCHES_PATH`).
+  - **Platform note:** on Mattermost, other bots' messages (CI alerts, webhooks) can trigger watches; Slack's event filtering means only human messages trigger there.
+  - Shared-infrastructure cleanup along the way: the per-platform YAML list store machinery behind routines and watches is now one `PlatformListStore` base (with a shared add/fire-outcome/manage-command core), the strict-JSON extraction all haiku one-shots use lives in one shared helper, and the channel-memory store now uses the shared mutex/atomic-write primitives.
+
+### Fixed
+- **DM auto-discovery instances now honor the parent platform's `memory`, `routines`, and `watches` settings.** Derived DM instances previously fell back to the fully-enabled defaults — a parent with `memory: false` (privacy) still got end-of-session distillation persisted from private DM conversations.
+- **Routines and watches refuse creation in direct-channel-mode channels.** A fired session there would be keyed on a thread that no typed message can reach (`!stop` and follow-ups route to the channel session). Existing DCM routines stay listable/pausable/deletable and their write-only runs keep working.
+- **Slack thread history now follows cursor pagination.** Threads longer than one API page (1000 messages) previously returned the oldest page's tail as "recent context" for context prompts, work summaries, and memory distillation.
+- **Reconfiguring a platform via the wizard no longer drops settings the prompts don't ask about** (`memory`, `routines`, `watches`, `skipPermissions`, `auditLog`, `ackReaction`, and any future field) — the edit now merges over the existing entry instead of replacing it.
+- **Store hardening:** a failed write can no longer leave a phantom item in the in-memory cache; writes refuse to proceed over an existing-but-unreadable store file instead of destroying it; store reads hand out copies, never live cache references; hand-edited watch keywords are normalized to lowercase (uppercase keywords could never match).
+- **Watch confirm hardening:** the haiku confirm quotes every message line so a spoofed end-delimiter cannot smuggle instructions out of the data block; the confirm budget covers slow hosts (20s) and failures log at warn instead of debug.
+
+## [1.28.0] - 2026-08-21
+
 ### Added
 - **Audit trail (`auditLog`)** - Opt-in per platform: an append-only JSONL stream per platform (`~/.claude-threads/audit/`, files `0600` enforced even on pre-existing artifacts, symlink-refusing writer, never deleted by the bot) recording what the bot did — every tool call Claude issued incl. `server_tool_use` and subagent sidechains (with Bash command line / file path / pattern as detail), session lifecycle incl. failure paths with the triggering user, security-relevant `!commands` (`!kill` and paused-session `!stop` included), routine creation, worktree/plugin mutations, and plan approvals with decider. Built for SIEM file ingestion; rotation/retention is the operator's call. Tool-permission allow/deny decisions stay out of scope (they resolve inside the MCP permission server subprocess; the issued request is still recorded).
 

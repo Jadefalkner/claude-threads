@@ -11,6 +11,8 @@ import { join } from 'path';
 
 // Mock the git/worktree module
 const mockIsGitRepository = mock(() => Promise.resolve(true));
+const mockDetectWorktreeInfo = mock(() =>
+  Promise.resolve(null as { repoRoot: string; worktreePath: string; branch: string } | null));
 const mockGetRepositoryRoot = mock(() => Promise.resolve('/repo'));
 const mockFindWorktreeByBranch = mock(() => Promise.resolve(null as { path: string; branch: string; isMain: boolean } | null));
 const mockCreateWorktree = mock(() => Promise.resolve());
@@ -18,9 +20,13 @@ const mockGetWorktreeDir = mock(() => '/repo-worktrees/feature-branch');
 const mockRemoveWorktree = mock(() => Promise.resolve());
 const mockIsValidWorktreePath = mock((path: string) => path.includes('/.claude-threads/worktrees/'));
 const mockWriteWorktreeMetadata = mock(() => Promise.resolve());
+// Default permissive; a specific test drives it false to exercise the
+// createAndSwitchToWorktree branch-validation chokepoint.
+const mockIsValidBranchName = mock((_name: string) => true);
 
 mock.module('../../git/worktree.js', () => ({
   isGitRepository: mockIsGitRepository,
+  detectWorktreeInfo: mockDetectWorktreeInfo,
   getRepositoryRoot: mockGetRepositoryRoot,
   findWorktreeByBranch: mockFindWorktreeByBranch,
   createWorktree: mockCreateWorktree,
@@ -28,7 +34,7 @@ mock.module('../../git/worktree.js', () => ({
   listWorktrees: mock(() => Promise.resolve([])),
   removeWorktree: mockRemoveWorktree,
   hasUncommittedChanges: mock(() => Promise.resolve(false)),
-  isValidBranchName: mock(() => true),
+  isValidBranchName: mockIsValidBranchName,
   isValidWorktreePath: mockIsValidWorktreePath,
   writeWorktreeMetadata: mockWriteWorktreeMetadata,
 }));
@@ -190,6 +196,8 @@ function createMockOptions() {
     // touching the filesystem.
     memoryStore: new MemoryStore(join(tmpdir(), 'claude-threads-test-memory')),
     getPlatformMemoryConfig: mock(() => MEMORY_DISABLED),
+    isRoutinesEnabled: mock(() => true),
+    isWatchesEnabled: mock(() => true),
   };
 }
 
@@ -205,6 +213,8 @@ describe('Worktree Module', () => {
     mockFindWorktreeByBranch.mockReset();
     mockCreateWorktree.mockReset();
     mockNewClaudeCliSendMessage.mockReset();
+    mockIsValidBranchName.mockReset();
+    mockIsValidBranchName.mockImplementation(() => true);
 
     // Set default return values
     mockIsGitRepository.mockImplementation(() => Promise.resolve(true));
@@ -784,6 +794,47 @@ describe('Worktree Module', () => {
         // Should attempt to create worktree (or find existing)
         expect(mockGetRepositoryRoot).toHaveBeenCalled();
       });
+
+      it('rejects an invalid/injection branch name before touching git', async () => {
+        // Regression: the in-session `!worktree <name>` path reaches
+        // createAndSwitchToWorktree directly, so branch validation must live
+        // here (not only on the interactive prompt path). A shell-metacharacter
+        // name must never reach `git worktree add`.
+        mockIsValidBranchName.mockImplementation((name: string) => !/[&|;$`(){}<>!'"#%\s]/.test(name));
+        const session = createMockSession({ startedBy: 'testuser' });
+        const options = createMockOptions();
+
+        await worktree.createAndSwitchToWorktree(session, 'buildfix&calc.exe&', 'testuser', options);
+
+        // Rejected up front: no git work attempted, a warning was posted.
+        expect(mockCreateWorktree).not.toHaveBeenCalled();
+        expect(session.platform.createPost).toHaveBeenCalled();
+        const warning = (session.platform.createPost as ReturnType<typeof mock>).mock.calls[0]?.[0] as string;
+        expect(warning).toContain('Invalid branch name');
+      });
+
+      it("rejects an allowlisted non-participant under approvals: 'owner'", async () => {
+        // Worktree commands change the session's working directory — under
+        // owner-scoped approvals they must require session participation,
+        // like every other owner-gated command (requireSessionOwner). The
+        // old ad-hoc check let any platform-allowlisted user through.
+        const platform = createMockPlatform({
+          isUserAllowed: mock(() => true),
+        });
+        (platform as unknown as { approvals: string }).approvals = 'owner';
+        const session = createMockSession({
+          startedBy: 'owner',
+          sessionAllowedUsers: new Set(['owner']),
+          platform,
+        });
+        const options = createMockOptions();
+
+        await worktree.createAndSwitchToWorktree(session, 'feature-branch', 'allowlisted-outsider', options);
+
+        expect(mockCreateWorktree).not.toHaveBeenCalled();
+        const warning = (platform.createPost as ReturnType<typeof mock>).mock.calls[0]?.[0] as string;
+        expect(warning).toContain('session participants');
+      });
     });
   });
 
@@ -876,6 +927,43 @@ describe('Worktree Module', () => {
       const session = createMockSession();
       const result = await worktree.shouldPromptForWorktree(session, 'require', () => false);
       expect(result).toBe('require');
+    });
+
+    it('records the worktree and skips the prompt when the session starts inside one', async () => {
+      mockDetectWorktreeInfo.mockResolvedValueOnce({
+        repoRoot: '/repo',
+        worktreePath: '/repo-worktrees/task-1',
+        branch: 'task-1',
+      });
+      const mockSetWorktreeInfo = mock(() => {});
+      const session = createMockSession({
+        messageManager: { setWorktreeInfo: mockSetWorktreeInfo } as never,
+      });
+      const result = await worktree.shouldPromptForWorktree(session, 'require', () => false);
+      expect(result).toBeNull();
+      expect(session.worktreeInfo).toEqual({
+        repoRoot: '/repo',
+        worktreePath: '/repo-worktrees/task-1',
+        branch: 'task-1',
+      });
+      expect(mockSetWorktreeInfo).toHaveBeenCalledWith('/repo-worktrees/task-1', 'task-1');
+    });
+
+    it('does not run detection when worktreeMode is off', async () => {
+      mockDetectWorktreeInfo.mockClear();
+      const session = createMockSession();
+      const result = await worktree.shouldPromptForWorktree(session, 'off', () => false);
+      expect(result).toBeNull();
+      expect(mockDetectWorktreeInfo).not.toHaveBeenCalled();
+      expect(session.worktreeInfo).toBeUndefined();
+    });
+
+    it('still prompts in require mode when the working dir is not a worktree', async () => {
+      mockDetectWorktreeInfo.mockResolvedValueOnce(null);
+      const session = createMockSession();
+      const result = await worktree.shouldPromptForWorktree(session, 'require', () => false);
+      expect(result).toBe('require');
+      expect(session.worktreeInfo).toBeUndefined();
     });
   });
 

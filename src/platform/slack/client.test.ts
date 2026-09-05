@@ -5,7 +5,8 @@
  * SlackClient HTTP surface (fetch-backed).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { installFetchHarness, jsonResponse, type FetchResponder } from '../test-helpers/fetch-harness.js';
+import { describe, it, expect } from 'bun:test';
 import { getEmojiName } from '../utils.js';
 import { SlackClient } from './client.js';
 import type { SlackPlatformConfig } from '../../config/types.js';
@@ -71,35 +72,9 @@ describe('Slack Client Emoji Handling', () => {
 // pure helpers that don't need a WebSocket.
 // -----------------------------------------------------------------------------
 
-type FetchResponder = (url: string, init?: RequestInit) => Promise<Response> | Response;
-
-let fetchResponder: FetchResponder = () =>
-  new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-let fetchCalls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }> = [];
-
-const originalFetch = global.fetch;
-beforeEach(() => {
-  fetchCalls = [];
-  global.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-    const urlStr = typeof url === 'string' ? url : url.toString();
-    const method = (init?.method ?? 'GET').toUpperCase();
-    const headers: Record<string, string> = {};
-    if (init?.headers) {
-      const h = init.headers as Record<string, string>;
-      for (const k of Object.keys(h)) headers[k] = h[k];
-    }
-    let body: unknown;
-    if (typeof init?.body === 'string') {
-      try { body = JSON.parse(init.body); } catch { body = init.body; }
-    }
-    fetchCalls.push({ url: urlStr, method, headers, body });
-    return fetchResponder(urlStr, init);
-  }) as typeof global.fetch;
-});
-
-afterEach(() => {
-  global.fetch = originalFetch;
-});
+let fetchResponder: FetchResponder = () => jsonResponse({ ok: true });
+const harness = installFetchHarness(() => fetchResponder);
+const fetchCalls = harness.calls;
 
 function ok(body: Record<string, unknown> = {}): Response {
   return new Response(JSON.stringify({ ok: true, ...body }), {
@@ -141,14 +116,14 @@ function makeClient(overrides: Partial<SlackPlatformConfig> = {}): SlackClient {
 
 async function primeBotUser(client: SlackClient, userId = 'U-BOT') {
   fetchResponder = (url) => {
-    if (url.endsWith('auth.test')) return ok({ user_id: userId, url: 'https://team.slack.com/' });
+    if (url.endsWith('auth.test')) return ok({ user_id: userId, team_id: 'T-OURS', url: 'https://team.slack.com/' });
     if (url.includes('users.info')) {
       return ok({ user: { id: userId, name: 'claude', real_name: 'Claude', profile: {} } });
     }
     return ok();
   };
   await client.getBotUser();
-  fetchCalls = [];
+  fetchCalls.length = 0;
 }
 
 describe('SlackClient pure helpers', () => {
@@ -360,6 +335,66 @@ describe('SlackClient API methods', () => {
     expect(history.map(m => m.message)).toEqual(['middle', 'newest']);
   });
 
+  it('getThreadHistory follows cursor pagination past the first page', async () => {
+    // A thread longer than one conversations.replies page (1000 messages)
+    // returns its OLDEST page first; without walking next_cursor the
+    // "most recent N" slice would come from that oldest page and serve
+    // long-ago content as recent context.
+    const c = makeClient();
+    fetchResponder = (url) => {
+      if (url.includes('conversations.replies')) {
+        if (!url.includes('cursor=')) {
+          return ok({
+            messages: [
+              { ts: '100.0', user: 'U-ALICE', text: 'old-1' },
+              { ts: '200.0', user: 'U-ALICE', text: 'old-2' },
+            ],
+            response_metadata: { next_cursor: 'page2' },
+          });
+        }
+        expect(url).toContain('cursor=page2');
+        return ok({
+          messages: [
+            { ts: '300.0', user: 'U-ALICE', text: 'new-1' },
+            { ts: '400.0', user: 'U-ALICE', text: 'new-2' },
+          ],
+        });
+      }
+      if (url.includes('users.info')) {
+        return ok({ user: { id: 'U-ALICE', name: 'alice', real_name: 'Alice', profile: {} } });
+      }
+      return ok();
+    };
+    const history = await c.getThreadHistory('thread-1', { limit: 2 });
+    expect(history.map(m => m.message)).toEqual(['new-1', 'new-2']);
+  });
+
+  it('getThreadHistory without a limit fetches a single page (no unbounded walk)', async () => {
+    // With no limit there is no sliding window to keep bounded: walking
+    // every cursor would accumulate the whole thread in memory and issue a
+    // getUser call per message. The no-limit caller (getThreadContextCount)
+    // gets exactly one 1000-message page — the pre-walk behavior.
+    const c = makeClient();
+    let pages = 0;
+    fetchResponder = (url) => {
+      if (url.includes('conversations.replies')) {
+        pages++;
+        return ok({
+          messages: [{ ts: `${pages * 100}.0`, user: 'U-ALICE', text: `page-${pages}` }],
+          // Always offers another page; the client must not take it.
+          response_metadata: { next_cursor: `page${pages + 1}` },
+        });
+      }
+      if (url.includes('users.info')) {
+        return ok({ user: { id: 'U-ALICE', name: 'alice', real_name: 'Alice', profile: {} } });
+      }
+      return ok();
+    };
+    const history = await c.getThreadHistory('thread-1');
+    expect(pages).toBe(1);
+    expect(history.map(m => m.message)).toEqual(['page-1']);
+  });
+
   it('getThreadHistory returns [] on API error', async () => {
     fetchResponder = () => notOk('channel_not_found');
     const history = await makeClient().getThreadHistory('thread-1');
@@ -418,5 +453,123 @@ describe('SlackClient API methods', () => {
   it('downloadFile throws when no download URL is available', async () => {
     fetchResponder = () => ok({ file: { id: 'F1', name: 'x', size: 0, mimetype: '' } });
     await expect(makeClient().downloadFile('F1')).rejects.toThrow(/No download URL/);
+  });
+});
+
+describe('SlackClient bot-authored filter', () => {
+  // Slack stamps every API-posted message with the app's bot_id/app_id, even
+  // when it is posted with a person's user token. Only the person's own
+  // messages and posts made through this app's user token should reach Claude.
+  const OUR_APP = 'A-OURS';
+  const OUR_TEAM = 'T-OURS';
+
+  function hello(client: SlackClient, appId = OUR_APP) {
+    (client as any).handleSocketModeEvent({ type: 'hello', connection_info: { app_id: appId } });
+  }
+
+  function collectMessages(client: SlackClient): Array<{ userId: string }> {
+    const seen: Array<{ userId: string }> = [];
+    client.on('message', (post) => seen.push({ userId: post.userId }));
+    return seen;
+  }
+
+  async function inject(client: SlackClient, event: Record<string, unknown>) {
+    client._injectSlackEvent({ type: 'message', channel: 'C123', ts: '1.1', text: 'hi', team: OUR_TEAM, ...event } as any);
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
+  it('a post made through this app\'s own user token is the person\'s message', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    hello(client);
+    const seen = collectMessages(client);
+
+    await inject(client, { user: 'U-ALMIR', bot_id: 'B-PER-AUTH', app_id: OUR_APP });
+
+    expect(seen).toEqual([{ userId: 'U-ALMIR' }]);
+  });
+
+  it('the app id is also learned from an events_api envelope, for a socket that missed hello', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    const seen = collectMessages(client);
+
+    (client as any).handleSocketModeEvent({
+      type: 'events_api',
+      envelope_id: 'e1',
+      payload: { api_app_id: OUR_APP, event: { type: 'message', channel: 'C123', ts: '1.2', text: 'hi', user: 'U-ALMIR', bot_id: 'B-PER-AUTH', app_id: OUR_APP, team: OUR_TEAM } },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(seen).toEqual([{ userId: 'U-ALMIR' }]);
+  });
+
+  it('the bot\'s own replies stay ignored', async () => {
+    const client = makeClient();
+    await primeBotUser(client, 'U-BOT');
+    hello(client);
+    const seen = collectMessages(client);
+
+    await inject(client, { user: 'U-BOT', bot_id: 'B-OURS', app_id: OUR_APP });
+
+    expect(seen).toEqual([]);
+  });
+
+  it('another app\'s bot posts stay ignored', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    hello(client);
+    const seen = collectMessages(client);
+
+    await inject(client, { user: 'U-GITHUB-BOT', bot_id: 'B-GITHUB', app_id: 'A-GITHUB' });
+
+    expect(seen).toEqual([]);
+  });
+
+  it('a bot copy of this same app in another workspace (Slack Connect) stays ignored', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    hello(client);
+    const seen = collectMessages(client);
+
+    await inject(client, { user: 'U-BOT-REMOTE', bot_id: 'B-REMOTE', app_id: OUR_APP, team: 'T-REMOTE' });
+
+    expect(seen).toEqual([]);
+  });
+
+  it('a bot post without a user stays ignored, and so does everything with a bot_id before the app id is known', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    const seen = collectMessages(client);
+
+    await inject(client, { bot_id: 'B-CLASSIC', app_id: OUR_APP });
+    await inject(client, { user: 'U-ALMIR', bot_id: 'B-PER-AUTH', app_id: OUR_APP, ts: '1.3' });
+
+    expect(seen).toEqual([]);
+  });
+
+  it('missed-message recovery applies the same rule', async () => {
+    const client = makeClient();
+    await primeBotUser(client);
+    hello(client);
+    const seen = collectMessages(client);
+    (client as any).lastProcessedTs = '1.0';
+    fetchResponder = (url) => {
+      if (url.includes('conversations.history')) {
+        return ok({
+          messages: [
+            { type: 'message', ts: '1.1', text: 'relayed', user: 'U-ALMIR', bot_id: 'B-PER-AUTH', app_id: OUR_APP, team: OUR_TEAM },
+            { type: 'message', ts: '1.2', text: 'reply', user: 'U-BOT', bot_id: 'B-OURS', app_id: OUR_APP, team: OUR_TEAM },
+            { type: 'message', ts: '1.3', text: 'ci', user: 'U-GITHUB-BOT', bot_id: 'B-GITHUB', app_id: 'A-GITHUB', team: OUR_TEAM },
+            { type: 'message', ts: '1.4', text: 'remote copy', user: 'U-BOT-REMOTE', bot_id: 'B-REMOTE', app_id: OUR_APP, team: 'T-REMOTE' },
+          ],
+        });
+      }
+      return ok({ user: { id: 'U-ALMIR', name: 'almir', real_name: 'Almir', profile: {} } });
+    };
+
+    await (client as any).recoverMissedMessages();
+
+    expect(seen).toEqual([{ userId: 'U-ALMIR' }]);
   });
 });

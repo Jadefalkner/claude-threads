@@ -25,6 +25,7 @@ This is a multi-platform bot that lets users interact with Claude Code through c
 - **Permalink follower (`read_post` MCP tool)** - Claude can resolve a Mattermost or Slack permalink to its content (and optional thread context) inside the bot's own channel
 - **Persistent memory** - per-channel shared notes (`!remember` / `!memory`, Claude Tag style) plus Claude Code's native auto-memory redirected into bot-managed per-(platform, repo) directories; end-of-session distillation learns team facts over time
 - **Routines** - scheduled recurring work (`!routine every weekday at 9am, ...`, Claude Tag style): natural-language creation with 👍 confirmation, fired as bot-initiated session threads; `!routines` to list/pause/resume/delete/run
+- **Watches** - event triggers (`!watch when someone reports an incident, ...`): a free keyword prefilter plus a haiku semantic confirm fire a session in the triggering message's own thread; `!watches` to list/pause/resume/delete
 
 ## Contribution Conventions
 
@@ -283,14 +284,84 @@ like memory. A routine = `{name, prompt, schedule, createdBy}` stored in
 |------|------|
 | `src/persistence/routines-store.ts` | Store + `validateSchedule` (presets hourly/daily/weekdays/weekly — hourly is the floor, sub-hourly is unrepresentable). |
 | `src/routines/scheduler.ts` | `RoutineScheduler` (1-min tick, SessionMonitor pattern) + pure due-ness: wall-clock windows in the routine's timezone via Intl (DST-safe), period anchoring (one fire per hour/day/week), missed windows skipped. Auto-disable after 3 consecutive failures or a deauthorized creator. |
-| `src/routines/runner.ts` | `fireRoutine`: bot posts the thread root itself, then `startSession` as the creator — a normal session (platform permission mode, pool, memory, distillation). |
+| `src/routines/runner.ts` | `fireRoutine`: bot posts the thread root itself, then `startSession` as the creator — a normal session (pool, memory) but marked `unattended`, so it forces interactive permissions when `requireApproval` and (like watch fires) is **skipped by end-of-session distillation**. |
 | `src/routines/parser.ts` | NL → schedule via one haiku `quickQuery`, strict-JSON extraction + revalidation. Nothing saves without a human 👍 (PromptExecutor routine prompt → `routine-prompt:complete` → lifecycle listener writes the store). |
+
+Each routine carries a persisted `requireApproval` posture chosen at creation
+(👍 = interactive approval per action, ✅ = autonomous). The fired session sets
+`forceInteractivePermissions` when `requireApproval` is true, so a run acts
+under interactive permissions even on a `skipPermissions` platform. Safe
+default: `undefined`/older data → `true`; agent proposals never offer the
+autonomous option.
 
 Commands: `!routine <natural language>` (owner-gated create), `!routines`
 (list), `!routines pause|resume|delete <n>` (owner-gated), `!routines run <n>`.
 Config: per-platform `routines: false` disables; `limits.maxRoutines` caps
 (default 10). `createRoutine` takes an injectable `parse` fn — other test
 files module-mock quick-query.js, so tests inject rather than stub the CLI.
+
+## Watches (event triggers)
+
+The proactive counterpart to routines, scoped per platform instance. A watch
+= `{name, condition, prompt, keywords, createdBy}` stored in
+`~/.config/claude-threads/watches.yaml` (`WatchesStore`, 0600, override
+`CLAUDE_THREADS_WATCHES_PATH`). Both stores share `PlatformListStore`
+(`src/persistence/platform-list-store.ts`) for the CRUD/mutex/atomic-write
+machinery, and all haiku one-shots share `extractJsonObject`
+(`src/claude/llm-json.ts`).
+
+| File | Role |
+|------|------|
+| `src/persistence/watches-store.ts` | Store + `validateKeywords` (LLM-derived prefilter terms, normalized/capped). |
+| `src/watches/evaluator.ts` | `WatchEvaluator` — two-stage matching: free keyword prefilter over every otherwise-ignored channel message, then one haiku confirm per candidate (fail-closed). Guardrails checked before any model call: per-watch cooldown, daily cap, confirm-concurrency cap. At most one watch fires per message. Auto-disable after 3 failed fires / deauthorized creator. `evaluate` never throws (fire-and-forget from message handling). |
+| `src/watches/runner.ts` | `fireWatch`: `startSession` anchored on the **triggering message's thread** as the creator, with `autoIncludeContext: true` (skips the interactive context prompt; the thread is the event). Post-verifies registration (no phantom 'ok'). |
+| `src/watches/parser.ts` | NL → `{name, condition, prompt, keywords}` via one haiku `quickQuery`; keywords must cover synonyms + both languages for non-English requests. Nothing saves without a human 👍 (PromptExecutor watch prompt → `watch-prompt:complete` → lifecycle listener writes the store). |
+
+Each watch carries a persisted `requireApproval` posture chosen at creation
+(👍 = interactive approval per action, ✅ = autonomous, only for triggers the
+creator fully trusts — a watch fires on attacker-influenceable channel
+content). The fire path passes `forceApproval` into `runUnattendedSession`,
+forcing interactive permissions even under a `skipPermissions` platform. Safe
+default: `undefined`/older data → `true`; agent proposals never offer the
+autonomous option. **Distillation is skipped for unattended fires** so a
+prompt-injected fire cannot persist attacker-derived facts into channel memory.
+
+Hook point: `src/message-handler.ts` — `session.evaluateWatches(...)` fires
+only where a message would otherwise be dropped (after the session,
+paused-session, and command paths; before the mention-required return), so a
+session thread can never re-trigger a watch. Mattermost lets other bots'
+messages trigger (useful for CI bots); Slack filters all bot events.
+
+Commands: `!watch <natural language>` (owner-gated create), `!watches`
+(list), `!watches pause|resume|delete <n>` (owner-gated); no manual run.
+Config: per-platform `watches: false` disables; `limits.maxWatches` (10),
+`limits.watchCooldownMinutes` (5), `limits.watchDailyCap` (20).
+`createWatch` takes an injectable `parse` fn; the evaluator takes an
+injectable `confirm` fn (same DI-over-module-mock reasoning as routines).
+The integration mock CLI answers `claude -p` prompts deterministically
+(watch confirms honor `MOCK_WATCH_CONFIRM=false`).
+
+## Agent tools (Claude-initiated memory/routines/watches)
+
+Six MCP tools let Claude use the bot's features in-session: `remember_fact`,
+`list_memory`, `propose_routine`, `propose_watch`, `list_routines`,
+`list_watches`. Execution is bot-side: the MCP child forwards an
+`agent_action` request over the decision bridge; `handleAgentAction`
+(`src/operations/agent-actions/handler.ts`) applies the authoritative gates
+(config, DCM, unattended, session cap) and touches the stores. The env gates
+in `src/mcp/agent-features-env.ts` only decide tool registration.
+
+Invariants:
+- `propose_*` NEVER writes a store — it posts the existing confirmation card
+  (`postRoutineConfirmation`/`postWatchConfirmation`, badged
+  `proposedByAgent`) and only the human-👍 flow saves.
+- `Session.unattended` (persisted) marks routine/watch-fired sessions; they
+  are refused `propose_*` on both sides (self-replication loop).
+- `ClaudeCliOptions.agentFeatures` is REQUIRED (like `memory`) so every
+  spawn/respawn site must carry the gates — `buildRestartCliOptions` needs
+  its `ops` for this.
+- Memory writes use `source: 'agent'`: visible in `!memory`, may never
+  supersede `user` entries, evicted with `distilled` ones.
 
 ## Source Files
 
@@ -315,6 +386,7 @@ Session is a thin container; most logic lives in `src/operations/`:
 | `src/session/types.ts` | TypeScript types (Session interface) |
 | `src/session/registry.ts` | Session lookup and registration |
 | `src/session/timer-manager.ts` | Per-session timer management |
+| `src/session/metadata-suggestions.ts` | Out-of-band haiku title/tag suggestions + periodic reclassification |
 | `src/session/index.ts` | Public exports |
 
 ### Operations Layer (The Brain)
@@ -329,7 +401,10 @@ Most business logic lives in `src/operations/`:
 | `src/operations/types.ts` | Operation types (MessageOperation, TaskItem, etc.) |
 | `src/operations/post-helpers/` | DRY utilities for posting messages (postInfo, postError, etc.) |
 | `src/operations/events/handler.ts` | Claude CLI event handling |
-| `src/operations/commands/handler.ts` | User commands (!cd, !invite, !kick, !permissions) |
+| `src/operations/commands/handler.ts` | User commands (!cd, !invite, !kick, !permissions, session control) |
+| `src/operations/commands/guards.ts` | Shared command gates: owner/participant authorization + audit hook |
+| `src/operations/commands/memory.ts` | Channel memory commands (!remember, !memory) |
+| `src/operations/commands/automation.ts` | Routines + watches commands (!routine(s), !watch(es)) incl. the shared manage surface |
 | `src/operations/streaming/handler.ts` | Message batching and flushing to chat |
 | `src/operations/context-prompt/handler.ts` | Thread context prompt for mid-thread session starts |
 | `src/operations/worktree/handler.ts` | Git worktree management |
@@ -535,7 +610,7 @@ The version is checked at startup against a three-tier policy
 | CLI version | Behavior |
 |-------------|----------|
 | Below `2.0.74` (hard floor) | Error message and **exit** — the bot can't work at all |
-| `>=2.0.74 <2.2.0` (verified range; latest verified: 2.1.226) | Runs normally |
+| `>=2.0.74 <2.2.0` (verified range; latest verified: 2.1.251) | Runs normally |
 | Newer 2.x above the verified range | **Warn-and-run**: startup warning + "⚠️ untested" marker in the sticky message and session headers. A new CLI minor must not take every bot down until a claude-threads release ships |
 | A new major (3.x+) | Error message and **exit** — different contract, warn-and-run would be reckless |
 
@@ -546,7 +621,7 @@ next to the CLI version in the sticky message and session headers.
 
 To install the latest verified version:
 ```bash
-npm install -g @anthropic-ai/claude-code@2.1.226
+npm install -g @anthropic-ai/claude-code@2.1.251
 ```
 
 The Claude CLI version is displayed:

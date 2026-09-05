@@ -9,7 +9,19 @@
  */
 
 import type { Session } from './types.js';
+import { isRevivable } from '../persistence/session-store.js';
 import type { SessionStore, PersistedSession } from '../persistence/session-store.js';
+
+/**
+ * THE composite session id format (`platformId:threadId`). Every producer —
+ * the registry, SessionManager, and lifecycle's in-flight-start keys — must
+ * build ids through this function: the watch/routine runners consult
+ * `isSessionStartInFlight` with ids from `ctx.ops.getSessionId`, so a
+ * format drift between producers would silently disable that guard.
+ */
+export function compositeSessionId(platformId: string, threadId: string): string {
+  return `${platformId}:${threadId}`;
+}
 
 /**
  * Registry for tracking active sessions and their posts.
@@ -37,7 +49,7 @@ export class SessionRegistry {
    * Generate composite session ID from platform and thread.
    */
   getSessionId(platformId: string, threadId: string): string {
-    return `${platformId}:${threadId}`;
+    return compositeSessionId(platformId, threadId);
   }
 
   /**
@@ -64,10 +76,21 @@ export class SessionRegistry {
   }
 
   /**
-   * Find active session by thread ID alone (searches all platforms).
-   * Use when platformId is not readily available.
+   * Find an active session by thread ID.
+   *
+   * When the caller knows the platform, pass `platformId`: the lookup then
+   * resolves O(1) against the composite key and is scoped to that platform.
+   * platformId is the session store's privacy boundary, so a thread id that
+   * collides across platforms must not resolve to another platform's active
+   * session — security-relevant callers (the message router, the in-session
+   * authorization check) always pass it. Without a `platformId` this falls
+   * back to an unscoped scan across all platforms, kept for the callers that
+   * genuinely don't have one to hand.
    */
-  findByThreadId(threadId: string): Session | undefined {
+  findByThreadId(threadId: string, platformId?: string): Session | undefined {
+    if (platformId !== undefined) {
+      return this.find(platformId, threadId);
+    }
     for (const session of this.sessions.values()) {
       if (session.threadId === threadId) {
         return session;
@@ -205,16 +228,30 @@ export class SessionRegistry {
   /**
    * Get persisted session by thread ID alone (searches all platforms).
    *
-   * Intentionally includes soft-deleted sessions: when a user replies in a
-   * thread whose paused session was soft-deleted by `cleanStale()` on the
+   * Intentionally includes STALE soft-deleted sessions: when a user replies in
+   * a thread whose paused session was soft-deleted by `cleanStale()` on the
    * most recent bot restart, we still want to be able to resume it — that
    * matches the 🔄-reaction resume path (which uses `findByPostId`, also
    * reading raw data) and honors the "send a new message to continue"
    * promise in the timeout message. Sessions permanently deleted by
    * `cleanHistory()` are gone from the file and won't be found here.
+   *
+   * It excludes `'stopped'` tombstones — see the body, and `EndReason`.
    */
-  getPersistedByThreadId(threadId: string): PersistedSession | undefined {
-    return this.sessionStore.findByThreadIdAnyState(threadId);
+  getPersistedByThreadId(threadId: string, platformId?: string): PersistedSession | undefined {
+    const persisted = this.sessionStore.findByThreadIdAnyState(threadId, platformId);
+    // Live records and STALE tombstones only. A stale one is aged-out, not
+    // ended, and a reply is meant to revive it — that is the whole reason this
+    // lookup sees past `cleanedAt` instead of using `load()`.
+    //
+    // A `'stopped'` tombstone must stay invisible here. This lookup is the gate
+    // into the paused-session branch, and that branch CLAIMS the message: a
+    // record visible here but not resumable leaves the thread unreachable in
+    // both directions — which is exactly how `!stop` used to make a
+    // direct-channel-mode channel permanently deaf. Invisible means the message
+    // falls through to the new-session path and the user gets the fresh session
+    // `!stop` implies.
+    return persisted && isRevivable(persisted) ? persisted : undefined;
   }
 
   /**

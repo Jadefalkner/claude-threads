@@ -21,15 +21,6 @@ export {
   setGitHubEmail,
   setRespondOnlyWhenMentioned,
 
-  // Channel memory
-  rememberEntry,
-  showMemory,
-  forgetMemory,
-
-  // Routines
-  createRoutine,
-  manageRoutines,
-
   // Permission management
   setSessionPermissionMode,
 
@@ -51,5 +42,11 @@ export {
   // Restart helper (used by plugin handler)
   restartClaudeSession,
 } from './handler.js';
+
+// Channel memory commands
+export { rememberEntry, showMemory, forgetMemory } from './memory.js';
+
+// Automation commands (routines + watches)
+export { createRoutine, manageRoutines, createWatch, manageWatches } from './automation.js';
 
 export type { AutoUpdateManagerInterface } from './handler.js';

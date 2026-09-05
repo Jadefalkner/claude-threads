@@ -12,6 +12,7 @@ import { effectivePermissionMode } from '../../config/index.js';
 import { resolveSessionMemory, type MemoryStore } from '../../memory/store.js';
 import type { PlatformFile } from '../../platform/index.js';
 import { suggestBranchNames } from '../suggestions/branch.js';
+import { requireSessionOwner } from '../commands/guards.js';
 import {
   isGitRepository,
   getRepositoryRoot,
@@ -25,6 +26,7 @@ import {
   isValidBranchName,
   writeWorktreeMetadata,
   isValidWorktreePath,
+  detectWorktreeInfo,
 } from '../../git/worktree.js';
 import type { ClaudeCliOptions, ClaudeEvent } from '../../claude/cli.js';
 import { ClaudeCli } from '../../claude/cli.js';
@@ -50,6 +52,17 @@ import { formatUserTurn, shouldAttribute } from '../user-attribution/index.js';
 
 const log = createLogger('worktree');
 const sessionLog = createSessionLog(log);
+
+/**
+ * Make a rejected branch name safe to show inside a markdown code span. The
+ * name failed validation precisely because it contains something unusual — a
+ * backtick would otherwise break out of the `code` span in the error post, and
+ * a newline would break the line. Strip both for display only (the rejection
+ * itself already happened on the raw value).
+ */
+function displayBranchName(name: string): string {
+  return name.replace(/[`\r\n]/g, '').slice(0, 100);
+}
 
 /**
  * Parse git worktree errors and return a user-friendly message.
@@ -151,6 +164,20 @@ export async function shouldPromptForWorktree(
 
   // Skip if already in a worktree
   if (session.worktreeInfo) return null;
+
+  // Started directly inside a worktree (e.g. a dynamic-channel session whose
+  // channel IS the worktree): the isolation requirement is already satisfied.
+  // Detect and record it instead of prompting for a worktree-in-a-worktree.
+  const detected = await detectWorktreeInfo(session.workingDir);
+  if (detected) {
+    session.worktreeInfo = {
+      repoRoot: detected.repoRoot,
+      worktreePath: detected.worktreePath,
+      branch: detected.branch,
+    };
+    session.messageManager?.setWorktreeInfo(detected.worktreePath, detected.branch);
+    return null;
+  }
 
   // Check if we're in a git repository
   const isRepo = await isGitRepository(session.workingDir);
@@ -315,7 +342,7 @@ export async function handleWorktreeBranchResponse(
 
   // Validate branch name
   if (!isValidBranchName(branchName)) {
-    await postError(session, `Invalid branch name: \`${branchName}\`. Please provide a valid git branch name.`);
+    await postError(session, `Invalid branch name: \`${displayBranchName(branchName)}\`. Please provide a valid git branch name.`);
     sessionLog(session).warn(`🌿 Invalid branch name: ${branchName}`);
     return true; // We handled it, but need another response
   }
@@ -344,7 +371,7 @@ export async function handleWorktreeSkip(
   session: Session,
   username: string,
   persistSession: (session: Session) => void,
-  offerContextPrompt: (session: Session, queuedPrompt: string, queuedFiles?: PlatformFile[], excludePostId?: string, sender?: string) => Promise<boolean>
+  offerContextPrompt: (session: Session, queuedPrompt: string, queuedFiles?: PlatformFile[], excludePostId?: string, sender?: string, autoInclude?: boolean) => Promise<boolean>
 ): Promise<void> {
   // Check if we're handling a failure retry prompt or the initial worktree prompt
   const isFailurePrompt = !!session.pendingWorktreeFailurePrompt;
@@ -411,7 +438,7 @@ export async function createAndSwitchToWorktree(
     persistSession: (session: Session) => void;
     startTyping: (session: Session) => void;
     stopTyping: (session: Session) => void;
-    offerContextPrompt: (session: Session, queuedPrompt: string, queuedFiles?: PlatformFile[], excludePostId?: string, sender?: string) => Promise<boolean>;
+    offerContextPrompt: (session: Session, queuedPrompt: string, queuedFiles?: PlatformFile[], excludePostId?: string, sender?: string, autoInclude?: boolean) => Promise<boolean>;
     buildMessageContent: (text: string, session: Session, files?: PlatformFile[]) => Promise<BuiltMessageContent>;
     // Context preservation for mid-session worktree creation
     generateWorkSummary: (session: Session) => Promise<string | undefined>;
@@ -421,15 +448,25 @@ export async function createAndSwitchToWorktree(
     githubEmailsStore: { get(platformId: string, username: string): string | undefined };
     memoryStore: MemoryStore;
     getPlatformMemoryConfig: (platformId: string) => ResolvedMemoryConfig;
+    isRoutinesEnabled: (platformId: string) => boolean;
+    isWatchesEnabled: (platformId: string) => boolean;
     registerPost: (postId: string, threadId: string) => void;
     updateStickyMessage: () => Promise<void>;
     registerWorktreeUser?: (worktreePath: string, sessionId: string) => void;
   }
 ): Promise<void> {
-  // Only session owner or admins can manage worktrees
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only @${session.startedBy} or allowed users can manage worktrees`);
-    sessionLog(session).warn(`🌿 Unauthorized: @${username} tried to manage worktrees`);
+  if (!await requireSessionOwner(session, username, 'manage worktrees')) return;
+
+  // SECURITY: validate the branch name at this chokepoint, not just on the
+  // interactive prompt path. The in-session `!worktree <name>` command reaches
+  // here directly (bypassing `handleWorktreeBranchResponse`'s check), so an
+  // unvalidated branch would otherwise flow into `git worktree add`. Rejecting
+  // git-illegal and shell-metacharacter names here closes both git flag
+  // injection (a leading `-`) and — on Windows, where the spawn wrapper adds
+  // `shell:true` — cmd.exe command injection.
+  if (!isValidBranchName(branch)) {
+    await postError(session, `Invalid branch name: \`${displayBranchName(branch)}\`. Please provide a valid git branch name.`);
+    sessionLog(session).warn(`🌿 Rejected invalid branch name: ${branch}`);
     return;
   }
 
@@ -515,6 +552,8 @@ export async function createAndSwitchToWorktree(
           ...buildRestartCliOptions(session, {
             chromeEnabled: options.chromeEnabled,
             permissionTimeoutMs: options.permissionTimeoutMs,
+            // options structurally satisfies AgentFeatureOps.
+            ops: options,
           }),
           workingDir: existing.path,
           permissionMode: effectivePermissionMode({
@@ -694,6 +733,8 @@ export async function createAndSwitchToWorktree(
         ...buildRestartCliOptions(session, {
           chromeEnabled: options.chromeEnabled,
           permissionTimeoutMs: options.permissionTimeoutMs,
+          // options structurally satisfies AgentFeatureOps.
+          ops: options,
         }),
         workingDir: worktreePath,
         permissionMode: effectivePermissionMode({
@@ -855,12 +896,7 @@ export async function switchToWorktree(
   username: string,
   changeDirectory: (threadId: string, newDir: string, username: string) => Promise<void>
 ): Promise<void> {
-  // Only session owner or admins can manage worktrees
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only @${session.startedBy} or allowed users can manage worktrees`);
-    sessionLog(session).warn(`🌿 Unauthorized: @${username} tried to switch worktree`);
-    return;
-  }
+  if (!await requireSessionOwner(session, username, 'switch worktrees')) return;
 
   // Get current repo root
   const repoRoot = session.worktreeInfo?.repoRoot || await getRepositoryRoot(session.workingDir);
@@ -980,12 +1016,7 @@ export async function removeWorktreeCommand(
   branchOrPath: string,
   username: string
 ): Promise<void> {
-  // Only session owner or admins can manage worktrees
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only @${session.startedBy} or allowed users can manage worktrees`);
-    sessionLog(session).warn(`🌿 Unauthorized: @${username} tried to remove worktree`);
-    return;
-  }
+  if (!await requireSessionOwner(session, username, 'remove worktrees')) return;
 
   // Get current repo root
   const repoRoot = session.worktreeInfo?.repoRoot || await getRepositoryRoot(session.workingDir);
@@ -1046,12 +1077,7 @@ export async function disableWorktreePrompt(
   username: string,
   persistSession: (session: Session) => void
 ): Promise<void> {
-  // Only session owner or admins can manage worktrees
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only @${session.startedBy} or allowed users can manage worktrees`);
-    sessionLog(session).warn(`🌿 Unauthorized: @${username} tried to disable worktree prompts`);
-    return;
-  }
+  if (!await requireSessionOwner(session, username, 'disable worktree prompts')) return;
 
   session.worktreePromptDisabled = true;
   persistSession(session);
@@ -1085,12 +1111,7 @@ export async function cleanupWorktreeCommand(
   hasOtherSessionsUsingWorktree: (worktreePath: string, excludeSessionId: string) => boolean,
   changeDirectory: (threadId: string, path: string, username: string) => Promise<void>
 ): Promise<void> {
-  // Only session owner or admins can manage worktrees
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only @${session.startedBy} or allowed users can manage worktrees`);
-    sessionLog(session).warn(`🌿 Unauthorized: @${username} tried to cleanup worktree`);
-    return;
-  }
+  if (!await requireSessionOwner(session, username, 'clean up worktrees')) return;
 
   // Check if we're in a worktree
   if (!session.worktreeInfo) {

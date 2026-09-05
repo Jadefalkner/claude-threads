@@ -22,6 +22,9 @@ import { GitHubEmailsStore } from '../persistence/github-emails-store.js';
 import { WorktreeMode, type LimitsConfig, type ResolvedLimits, type ClaudeAccount, type PermissionMode, type OverheadVisibility, type PlatformOverhead, type ResolvedMemoryConfig, DEFAULT_OVERHEAD_VISIBILITY, DEFAULT_MEMORY_CONFIG, resolveLimits, effectivePermissionMode } from '../config/index.js';
 import { MemoryStore } from '../memory/store.js';
 import { RoutinesStore, type Routine, type RoutineRunStatus } from '../persistence/routines-store.js';
+import { WatchesStore } from '../persistence/watches-store.js';
+import { WatchEvaluator } from '../watches/evaluator.js';
+import { fireWatch } from '../watches/runner.js';
 import { RoutineScheduler } from '../routines/scheduler.js';
 import { fireRoutine } from '../routines/runner.js';
 import { AccountPool } from '../claude/account-pool.js';
@@ -41,7 +44,8 @@ import * as contextPrompt from '../operations/context-prompt/index.js';
 import * as stickyMessage from '../operations/sticky-message/index.js';
 import * as plugin from '../operations/plugin/index.js';
 import type { Session, InitialSessionOptions } from './types.js';
-import { SessionRegistry } from './registry.js';
+import { maybeInjectMetadataReminder } from './metadata-suggestions.js';
+import { compositeSessionId, SessionRegistry } from './registry.js';
 import * as reactionRouter from './reaction-router.js';
 import { post } from '../operations/post-helpers/index.js';
 import { createLogger } from '../utils/logger.js';
@@ -123,6 +127,9 @@ export class SessionManager extends EventEmitter {
   // Scheduled routines (Claude Tag-style recurring work)
   private routinesStore!: RoutinesStore;
   private routineScheduler: RoutineScheduler | null = null;
+  // Event triggers (Claude Tag-style proactiveness)
+  private watchesStore!: WatchesStore;
+  private watchEvaluator: WatchEvaluator | null = null;
 
   // Background tasks
   private sessionMonitor: SessionMonitor | null = null;       // Idle timeout + sticky refresh (1 min)
@@ -143,6 +150,9 @@ export class SessionManager extends EventEmitter {
 
   // Per-platform routines toggle (default: enabled)
   private platformRoutines: Map<string, boolean> = new Map();
+
+  // Per-platform watches toggle (default: enabled)
+  private platformWatches: Map<string, boolean> = new Map();
 
   // Auto-update manager (set via setAutoUpdateManager)
   private autoUpdateManager: commands.AutoUpdateManagerInterface | null = null;
@@ -191,6 +201,7 @@ export class SessionManager extends EventEmitter {
     this.githubEmailsStore = new GitHubEmailsStore();
     this.memoryStore = new MemoryStore();
     this.routinesStore = new RoutinesStore();
+    this.watchesStore = new WatchesStore();
     this.registry = new SessionRegistry(this.sessionStore);
     this.accountPool = new AccountPool(claudeAccounts);
 
@@ -227,6 +238,23 @@ export class SessionManager extends EventEmitter {
         ).catch(() => {});
       },
     });
+
+    this.watchEvaluator = new WatchEvaluator({
+      store: this.watchesStore,
+      isWatchesEnabled: (pid) => this.platformWatches.get(pid) ?? true,
+      fireWatch: (pid, watch, post, author) => fireWatch(watch, pid, post, author, this.getContext()),
+      notifyDisabled: async (pid, watch, reason) => {
+        const platform = this.platforms.get(pid);
+        if (!platform) return;
+        const formatter = platform.getFormatter();
+        await platform.createPost(
+          `\u{1F441}\uFE0F ${formatter.formatBold(`Watch "${watch.name}" disabled`)} — ${reason}. ` +
+          `Re-enable with ${formatter.formatCode('!watches resume <n>')} once resolved.`,
+        ).catch(() => {});
+      },
+      cooldownMs: this.limits.watchCooldownMinutes * 60 * 1000,
+      dailyCap: this.limits.watchDailyCap,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -236,17 +264,24 @@ export class SessionManager extends EventEmitter {
   addPlatform(
     platformId: string,
     client: PlatformClient,
-    overhead?: Partial<PlatformOverhead>,
-    memory?: ResolvedMemoryConfig,
-    routinesEnabled?: boolean
+    // A keyed options object, not positional params: the tail used to be
+    // two adjacent optional booleans, and a transposed call site would have
+    // silently enabled the wrong feature per platform.
+    options?: {
+      overhead?: Partial<PlatformOverhead>;
+      memory?: ResolvedMemoryConfig;
+      routinesEnabled?: boolean;
+      watchesEnabled?: boolean;
+    },
   ): void {
     this.platforms.set(platformId, client);
     this.platformOverhead.set(platformId, {
-      sessionHeader: overhead?.sessionHeader ?? DEFAULT_OVERHEAD_VISIBILITY,
-      stickyMessage: overhead?.stickyMessage ?? DEFAULT_OVERHEAD_VISIBILITY,
+      sessionHeader: options?.overhead?.sessionHeader ?? DEFAULT_OVERHEAD_VISIBILITY,
+      stickyMessage: options?.overhead?.stickyMessage ?? DEFAULT_OVERHEAD_VISIBILITY,
     });
-    this.platformMemory.set(platformId, memory ?? DEFAULT_MEMORY_CONFIG);
-    this.platformRoutines.set(platformId, routinesEnabled ?? true);
+    this.platformMemory.set(platformId, options?.memory ?? DEFAULT_MEMORY_CONFIG);
+    this.platformRoutines.set(platformId, options?.routinesEnabled ?? true);
+    this.platformWatches.set(platformId, options?.watchesEnabled ?? true);
     client.on('message', (post, user) => this.handleMessage(platformId, post, user));
     client.on('reaction', (reaction, user) => {
       if (user) {
@@ -277,6 +312,7 @@ export class SessionManager extends EventEmitter {
     this.platformOverhead.delete(platformId);
     this.platformMemory.delete(platformId);
     this.platformRoutines.delete(platformId);
+    this.platformWatches.delete(platformId);
     stickyMessage.clearHiddenCleanupTracking(platformId);
   }
 
@@ -342,6 +378,17 @@ export class SessionManager extends EventEmitter {
    * Made public to allow direct access from message-handler.ts,
    * enabling elimination of thin wrapper methods.
    */
+  /**
+   * Run `fn` against the active session for a thread; silently a no-op when
+   * none exists — the shared prologue of ~40 thread-addressed delegate
+   * methods below.
+   */
+  private async withSession(threadId: string, fn: (session: Session) => Promise<unknown> | unknown): Promise<void> {
+    const session = this.findSessionByThreadId(threadId);
+    if (!session) return;
+    await fn(session);
+  }
+
   getContext(): SessionContext {
     const config: SessionConfig = {
       workingDir: this.workingDir,
@@ -352,6 +399,7 @@ export class SessionManager extends EventEmitter {
       debug: this.debug,
       maxSessions: this.limits.maxSessions,
       maxRoutines: this.limits.maxRoutines,
+      maxWatches: this.limits.maxWatches,
       threadLogsEnabled: this.threadLogsEnabled,
       threadLogsRetentionDays: this.threadLogsRetentionDays,
       permissionTimeoutMs: this.limits.permissionTimeoutSeconds * 1000,
@@ -366,6 +414,7 @@ export class SessionManager extends EventEmitter {
       githubEmailsStore: this.githubEmailsStore,
       memoryStore: this.memoryStore,
       routinesStore: this.routinesStore,
+      watchesStore: this.watchesStore,
       isShuttingDown: this.isShuttingDown,
     };
 
@@ -420,7 +469,7 @@ export class SessionManager extends EventEmitter {
       handleBugReportApproval: (s, approved, user) => commands.handleBugReportApproval(s, approved, user),
 
       // Context prompt (inlined - no wrapper method needed)
-      offerContextPrompt: (s, q, f, e, sender) => contextPrompt.offerContextPrompt(s, q, f, this.getContextPromptHandler(), e, sender),
+      offerContextPrompt: (s, q, f, e, sender, autoInclude) => contextPrompt.offerContextPrompt(s, q, f, this.getContextPromptHandler(), e, sender, autoInclude),
 
       // UI event emission
       emitSessionAdd: (s) => this.emitSessionAdd(s),
@@ -446,6 +495,8 @@ export class SessionManager extends EventEmitter {
       isRoutinesEnabled: (pid) => this.platformRoutines.get(pid) ?? true,
 
       fireRoutineNow: (pid, routine) => this.fireRoutineNowImpl(pid, routine),
+
+      isWatchesEnabled: (pid) => this.platformWatches.get(pid) ?? true,
     };
 
     return createSessionContext(config, state, ops);
@@ -456,7 +507,7 @@ export class SessionManager extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   private getSessionId(platformId: string, threadId: string): string {
-    return `${platformId}:${threadId}`;
+    return compositeSessionId(platformId, threadId);
   }
 
   // ---------------------------------------------------------------------------
@@ -577,7 +628,7 @@ export class SessionManager extends EventEmitter {
       registerPost: (pid, tid) => this.registerPost(pid, tid),
       startTyping: (s) => this.startTyping(s),
       persistSession: (s) => this.persistSession(s),
-      injectMetadataReminder: (msg, session) => lifecycle.maybeInjectMetadataReminder(msg, session),
+      injectMetadataReminder: (msg, session) => maybeInjectMetadataReminder(msg, session),
       buildMessageContent: (text, session, files) => {
         const uploadDir = streaming.getSessionUploadDir(session.platformId, session.threadId);
         return streaming.buildMessageContent(text, session.platform, uploadDir, files, this.debug);
@@ -679,6 +730,21 @@ export class SessionManager extends EventEmitter {
   // Persistence
   // ---------------------------------------------------------------------------
 
+  /**
+   * Bound a free-text field before it enters sessions.json. The whole file is
+   * rewritten (JSON.stringify) on every mutation, so an unbounded user prompt
+   * would inflate every subsequent atomic rewrite. The cap is deliberately
+   * generous — far above any real prompt — so it only trims pathological
+   * multi-megabyte input and never a genuine message. A short marker records
+   * that truncation happened.
+   */
+  private static readonly MAX_PERSISTED_TEXT = 100_000;
+  private static capPersistedText(value: string | undefined | null): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (value.length <= SessionManager.MAX_PERSISTED_TEXT) return value;
+    return value.slice(0, SessionManager.MAX_PERSISTED_TEXT) + '…[truncated]';
+  }
+
   private persistSession(session: Session): void {
     try {
       this.persistSessionUnsafe(session);
@@ -729,7 +795,7 @@ export class SessionManager extends EventEmitter {
       sessionStartPostId: session.sessionStartPostId,
       // Task state from MessageManager serialize() (single source of truth).
       tasksPostId: taskListSnapshot?.postId ?? null,
-      lastTasksContent: taskListSnapshot?.content ?? null,
+      lastTasksContent: SessionManager.capPersistedText(taskListSnapshot?.content) ?? null,
       tasksCompleted: taskListSnapshot?.isCompleted ?? false,
       tasksMinimized: taskListSnapshot?.isMinimized ?? false,
       taskTrackerState: taskTrackerSnapshot,
@@ -737,10 +803,10 @@ export class SessionManager extends EventEmitter {
       isWorktreeOwner: session.isWorktreeOwner,
       pendingWorktreePrompt: session.pendingWorktreePrompt,
       worktreePromptDisabled: session.worktreePromptDisabled,
-      queuedPrompt: session.queuedPrompt,
+      queuedPrompt: SessionManager.capPersistedText(session.queuedPrompt),
       queuedByUsername: session.queuedByUsername,
       queuedFiles: session.queuedFiles,
-      firstPrompt: session.firstPrompt,
+      firstPrompt: SessionManager.capPersistedText(session.firstPrompt),
       pendingContextPrompt: contextPromptSnapshot,
       needsContextPromptOnNextMessage: session.needsContextPromptOnNextMessage,
       lifecyclePostId: session.lifecyclePostId,
@@ -753,13 +819,17 @@ export class SessionManager extends EventEmitter {
       resumeFailCount: session.lifecycle.resumeFailCount,
       claudeAccountId: session.claudeAccountId,
       sessionHeaderMode: session.sessionHeaderMode,
+      unattended: session.unattended,
     };
     this.sessionStore.save(session.sessionId, state);
   }
 
   private unpersistSession(sessionId: string): void {
-    // Soft-delete instead of hard delete - keeps session in history for display
-    this.sessionStore.softDelete(sessionId);
+    // Soft-delete instead of hard delete - keeps session in history for display.
+    // `'stopped'`: this is the sink for a session that ENDED — !stop, a kill, a
+    // normal exit. killSession has already distilled it as finished, so the
+    // next message in that thread must start fresh rather than revive it.
+    this.sessionStore.softDelete(sessionId, 'stopped');
   }
 
   // ---------------------------------------------------------------------------
@@ -1118,7 +1188,7 @@ export class SessionManager extends EventEmitter {
   }
 
   async startSession(
-    options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean },
+    options: { prompt: string; files?: PlatformFile[]; skipWorktreePrompt?: boolean; autoIncludeContext?: boolean },
     username: string,
     replyToPostId?: string,
     platformId: string = 'default',
@@ -1166,37 +1236,39 @@ export class SessionManager extends EventEmitter {
    * Check if a thread has a paused (persisted but not active) session.
    * Delegates to registry.getPersistedByThreadId() internally.
    */
-  hasPausedSession(threadId: string): boolean {
-    // If there's an active session, it's not paused
-    if (this.registry.findByThreadId(threadId)) return false;
+  hasPausedSession(threadId: string, platformId?: string): boolean {
+    // If there's an active session, it's not paused (scoped to platform when
+    // known, consistent with the persisted lookup below).
+    if (this.registry.findByThreadId(threadId, platformId)) return false;
     // Check for persisted session
-    return this.registry.getPersistedByThreadId(threadId) !== undefined;
+    return this.registry.getPersistedByThreadId(threadId, platformId) !== undefined;
   }
 
-  async resumePausedSession(threadId: string, message: string, files: PlatformFile[] | undefined, username: string): Promise<void> {
-    await lifecycle.resumePausedSession(threadId, message, files, this.getContext(), username);
+  async resumePausedSession(threadId: string, message: string, files: PlatformFile[] | undefined, username: string, platformId: string): Promise<void> {
+    await lifecycle.resumePausedSession(threadId, message, files, this.getContext(), username, platformId);
   }
 
-  getPersistedSession(threadId: string): PersistedSession | undefined {
-    return this.registry.getPersistedByThreadId(threadId);
+  getPersistedSession(threadId: string, platformId?: string): PersistedSession | undefined {
+    return this.registry.getPersistedByThreadId(threadId, platformId);
   }
 
   /**
    * Cancel a paused (persisted but not active) session by soft-deleting it.
    * Used when !stop is issued in a thread with a paused session.
    */
-  cancelPausedSession(threadId: string): void {
-    const persisted = this.registry.getPersistedByThreadId(threadId);
+  cancelPausedSession(threadId: string, platformId?: string): void {
+    const persisted = this.registry.getPersistedByThreadId(threadId, platformId);
     if (persisted) {
       const sessionId = `${persisted.platformId}:${persisted.threadId}`;
-      this.sessionStore.softDelete(sessionId);
+      // `!stop` on a paused thread means the same thing as `!stop` on a live
+      // one: the conversation is over. Without the reason, the next message
+      // would revive the very session the user was just told was cancelled.
+      this.sessionStore.softDelete(sessionId, 'stopped');
     }
   }
 
   async killSession(threadId: string, unpersist = true): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await lifecycle.killSession(session, unpersist, this.getContext());
+    return this.withSession(threadId, (session) => lifecycle.killSession(session, unpersist, this.getContext()));
   }
 
   async killAllSessions(): Promise<void> {
@@ -1205,39 +1277,27 @@ export class SessionManager extends EventEmitter {
 
   // Commands
   async cancelSession(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.cancelSession(session, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.cancelSession(session, username, this.getContext()));
   }
 
   async interruptSession(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.interruptSession(session, username);
+    return this.withSession(threadId, (session) => commands.interruptSession(session, username));
   }
 
   async approvePendingPlan(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.approvePendingPlan(session, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.approvePendingPlan(session, username, this.getContext()));
   }
 
   async changeDirectory(threadId: string, newDir: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.changeDirectory(session, newDir, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.changeDirectory(session, newDir, username, this.getContext()));
   }
 
   async inviteUser(threadId: string, invitedUser: string, invitedBy: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.inviteUser(session, invitedUser, invitedBy, this.getContext());
+    return this.withSession(threadId, (session) => commands.inviteUser(session, invitedUser, invitedBy, this.getContext()));
   }
 
   async kickUser(threadId: string, kickedUser: string, kickedBy: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.kickUser(session, kickedUser, kickedBy, this.getContext());
+    return this.withSession(threadId, (session) => commands.kickUser(session, kickedUser, kickedBy, this.getContext()));
   }
 
   async setGitHubEmail(
@@ -1252,37 +1312,69 @@ export class SessionManager extends EventEmitter {
 
   /** `!remember <text>` — add a note to the channel's shared memory. */
   async rememberEntry(threadId: string, text: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.rememberEntry(session, text, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.rememberEntry(session, text, username, this.getContext()));
   }
 
   /** `!memory` — show the channel's shared memory. */
   async showMemory(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.showMemory(session, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.showMemory(session, username, this.getContext()));
   }
 
   /** `!memory forget <n|text>|all` — remove channel memory entries. */
   async forgetMemory(threadId: string, selector: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.forgetMemory(session, selector, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.forgetMemory(session, selector, username, this.getContext()));
   }
 
   /** `!routine <natural language>` — propose a routine for confirmation. */
   async createRoutine(threadId: string, request: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.createRoutine(session, request, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.createRoutine(session, request, username, this.getContext()));
   }
 
   /** `!routines [subcommand]` — list/pause/resume/delete/run routines. */
   async manageRoutines(threadId: string, args: string | undefined, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.manageRoutines(session, args, username, this.getContext());
+    return this.withSession(threadId, (session) => commands.manageRoutines(session, args, username, this.getContext()));
+  }
+
+  /** `!watch <natural language>` — propose an event trigger for confirmation. */
+  async createWatch(threadId: string, request: string, username: string): Promise<void> {
+    return this.withSession(threadId, (session) => commands.createWatch(session, request, username, this.getContext()));
+  }
+
+  /** `!watches [subcommand]` — list/pause/resume/delete watches. */
+  async manageWatches(threadId: string, args: string | undefined, username: string): Promise<void> {
+    return this.withSession(threadId, (session) => commands.manageWatches(session, args, username, this.getContext()));
+  }
+
+  /**
+   * Evaluate a channel message against this platform's event triggers.
+   * Called fire-and-forget from the message handler for messages the bot
+   * would otherwise ignore; must never throw (the evaluator guards itself,
+   * this wrapper is belt-and-braces).
+   */
+  evaluateWatches(platformId: string, post: { id: string; rootId?: string; userId?: string }, author: string, message: string): void {
+    const evaluator = this.watchEvaluator;
+    if (!evaluator) return;
+    // The bot user id feeds the evaluator's belt-and-braces self-post guard.
+    // The evaluator calls the getter lazily (only when the platform actually
+    // has enabled watches), and the id is cached here because Mattermost's
+    // getBotUser() is an uncached API call — without the cache every
+    // prefilter candidate would cost an HTTP round-trip.
+    void evaluator
+      .evaluate(platformId, post, author, message, () => this.resolveBotUserId(platformId))
+      .catch(() => {});
+  }
+
+  /** Per-platform bot user ids for the watch self-post guard (see evaluateWatches). */
+  private readonly watchBotUserIds = new Map<string, string>();
+
+  private async resolveBotUserId(platformId: string): Promise<string | undefined> {
+    const cached = this.watchBotUserIds.get(platformId);
+    if (cached) return cached;
+    const botUser = await this.platforms.get(platformId)?.getBotUser().catch(() => null);
+    // Cache only successful lookups: a transient API failure must not pin
+    // "unknown" (guard disabled) for the rest of the process lifetime.
+    if (botUser?.id) this.watchBotUserIds.set(platformId, botUser.id);
+    return botUser?.id;
   }
 
   /**
@@ -1331,15 +1423,11 @@ export class SessionManager extends EventEmitter {
   }
 
   async reportBug(threadId: string, description: string | undefined, username: string, files?: PlatformFile[]): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.reportBug(session, description, username, this.getContext(), undefined, files);
+    return this.withSession(threadId, (session) => commands.reportBug(session, description, username, this.getContext(), undefined, files));
   }
 
   async showUpdateStatus(threadId: string, _username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.showUpdateStatus(session, this.autoUpdateManager, this.getContext());
+    return this.withSession(threadId, (session) => commands.showUpdateStatus(session, this.autoUpdateManager, this.getContext()));
   }
 
   /**
@@ -1395,34 +1483,24 @@ export class SessionManager extends EventEmitter {
   }
 
   async forceUpdateNow(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.forceUpdateNow(session, username, this.autoUpdateManager);
+    return this.withSession(threadId, (session) => commands.forceUpdateNow(session, username, this.autoUpdateManager));
   }
 
   async deferUpdate(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.deferUpdate(session, username, this.autoUpdateManager);
+    return this.withSession(threadId, (session) => commands.deferUpdate(session, username, this.autoUpdateManager));
   }
 
   // Plugin commands
   async pluginList(threadId: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await plugin.handlePluginList(session);
+    return this.withSession(threadId, (session) => plugin.handlePluginList(session));
   }
 
   async pluginInstall(threadId: string, pluginName: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await plugin.handlePluginInstall(session, pluginName, username, this.getContext());
+    return this.withSession(threadId, (session) => plugin.handlePluginInstall(session, pluginName, username, this.getContext()));
   }
 
   async pluginUninstall(threadId: string, pluginName: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await plugin.handlePluginUninstall(session, pluginName, username, this.getContext());
+    return this.withSession(threadId, (session) => plugin.handlePluginUninstall(session, pluginName, username, this.getContext()));
   }
 
   /**
@@ -1442,9 +1520,7 @@ export class SessionManager extends EventEmitter {
   }
 
   async requestMessageApproval(threadId: string, username: string, message: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await commands.requestMessageApproval(session, username, message, this.getContext());
+    return this.withSession(threadId, (session) => commands.requestMessageApproval(session, username, message, this.getContext()));
   }
 
   // Worktree commands
@@ -1490,7 +1566,7 @@ export class SessionManager extends EventEmitter {
       persistSession: (s) => this.persistSession(s),
       startTyping: (s) => this.startTyping(s),
       stopTyping: (s) => this.stopTyping(s),
-      offerContextPrompt: (s, q, f, e, sender) => contextPrompt.offerContextPrompt(s, q, f, this.getContextPromptHandler(), e, sender),
+      offerContextPrompt: (s, q, f, e, sender, autoInclude) => contextPrompt.offerContextPrompt(s, q, f, this.getContextPromptHandler(), e, sender, autoInclude),
       buildMessageContent: (text, s, files) => {
         const uploadDir = streaming.getSessionUploadDir(s.platformId, s.threadId);
         return streaming.buildMessageContent(text, s.platform, uploadDir, files, this.debug);
@@ -1502,6 +1578,8 @@ export class SessionManager extends EventEmitter {
       githubEmailsStore: this.githubEmailsStore,
       memoryStore: this.memoryStore,
       getPlatformMemoryConfig: (pid) => this.platformMemory.get(pid) ?? DEFAULT_MEMORY_CONFIG,
+      isRoutinesEnabled: (pid) => this.platformRoutines.get(pid) ?? true,
+      isWatchesEnabled: (pid) => this.platformWatches.get(pid) ?? true,
       registerPost: (postId, tid) => this.registerPost(postId, tid),
       updateStickyMessage: () => this.updateStickyMessage(),
       registerWorktreeUser: (path, sid) => this.registerWorktreeUser(path, sid),
@@ -1520,9 +1598,7 @@ export class SessionManager extends EventEmitter {
   }
 
   async listWorktreesCommand(threadId: string, _username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await worktreeModule.listWorktreesCommand(session);
+    return this.withSession(threadId, (session) => worktreeModule.listWorktreesCommand(session));
   }
 
   /**
@@ -1596,15 +1672,11 @@ export class SessionManager extends EventEmitter {
   }
 
   async removeWorktreeCommand(threadId: string, branchOrPath: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await worktreeModule.removeWorktreeCommand(session, branchOrPath, username);
+    return this.withSession(threadId, (session) => worktreeModule.removeWorktreeCommand(session, branchOrPath, username));
   }
 
   async disableWorktreePrompt(threadId: string, username: string): Promise<void> {
-    const session = this.findSessionByThreadId(threadId);
-    if (!session) return;
-    await worktreeModule.disableWorktreePrompt(session, username, (s) => this.persistSession(s));
+    return this.withSession(threadId, (session) => worktreeModule.disableWorktreePrompt(session, username, (s) => this.persistSession(s)));
   }
 
   async cleanupWorktreeCommand(threadId: string, username: string): Promise<void> {
@@ -1641,14 +1713,18 @@ export class SessionManager extends EventEmitter {
    * @param threadId - The thread ID to look up
    * @returns The post ID where the session started, or undefined if not found
    */
-  getSessionStartPostId(threadId: string): string | undefined {
+  getSessionStartPostId(threadId: string, platformId?: string): string | undefined {
     // First check active sessions
     const session = this.findSessionByThreadId(threadId);
     if (session?.sessionStartPostId) {
       return session.sessionStartPostId;
     }
-    // Then check persisted sessions (for resume scenarios)
-    const persisted = this.registry.getPersistedByThreadId(threadId);
+    // Then check persisted sessions (for resume scenarios). Scope by platform
+    // when the caller knows it, so a thread id that collides across platforms
+    // cannot return another platform's session (platformId is the store's hard
+    // privacy boundary). Only a read of a post id, so the param is optional for
+    // the handful of test-only callers.
+    const persisted = this.registry.getPersistedByThreadId(threadId, platformId);
     return persisted?.sessionStartPostId ?? undefined;
   }
 
@@ -1678,11 +1754,18 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  isUserAllowedInSession(threadId: string, username: string): boolean {
-    const session = this.findSessionByThreadId(threadId);
+  isUserAllowedInSession(threadId: string, username: string, platformId: string): boolean {
+    // Scope the active-session lookup to the message's platform too (not just
+    // the persisted branch below): a thread id colliding across platforms must
+    // not authorize a user against another platform's active session, and this
+    // must resolve the SAME session the message router did (message-handler
+    // also scopes its findByThreadId by platformId).
+    const session = this.registry.find(platformId, threadId);
     if (!session) {
-      // Check persisted session
-      const persisted = this.getPersistedSession(threadId);
+      // Check persisted session, scoped to the message's platform so a
+      // cross-platform thread-id collision cannot authorize a user against
+      // another platform's persisted allowlist.
+      const persisted = this.getPersistedSession(threadId, platformId);
       if (persisted) {
         return persisted.sessionAllowedUsers.includes(username) ||
                this.platforms.get(persisted.platformId)?.isUserAllowed(username) || false;

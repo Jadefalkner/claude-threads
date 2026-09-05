@@ -12,6 +12,7 @@
  */
 
 import { crossSpawn } from '../utils/spawn.js';
+import { getClaudePath } from './version-check.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('query');
@@ -67,7 +68,11 @@ export async function quickQuery(options: QuickQueryOptions): Promise<QuickQuery
 
   const startTime = Date.now();
 
-  const claudePath = process.env.CLAUDE_PATH || 'claude';
+  // getClaudePath, not a bare 'claude': it falls back to the common install
+  // locations, so hosts where the CLI isn't on PATH (but sessions work via
+  // the same resolution in cli.ts) don't have every haiku one-shot — routine
+  // and watch parses, watch confirms, memory distillation — silently fail.
+  const claudePath = getClaudePath();
   const args = ['-p', '--model', model];
 
   if (systemPrompt) {
@@ -154,6 +159,16 @@ export async function quickQuery(options: QuickQueryOptions): Promise<QuickQuery
     });
 
     // Write the prompt over stdin and close it so the CLI knows input ended.
+    // The 'error' listener is load-bearing: a child that closes its stdin
+    // while still alive makes this write raise EPIPE as a stream 'error'
+    // event, and with no listener that is an uncaught exception that kills
+    // the whole bot from paths documented as fire-and-forget (watch
+    // confirms, distillation). Verified empirically: `spawn('bash', ['-c',
+    // 'exec 0<&-; sleep 2'])` + a 1MB end() crashes node without this.
+    // The call itself still fails safely (timeout/empty-output path).
+    proc.stdin?.on('error', (err) => {
+      log.debug(`quickQuery: stdin write failed (${(err as NodeJS.ErrnoException).code ?? err.message})`);
+    });
     proc.stdin?.end(prompt);
   });
 }

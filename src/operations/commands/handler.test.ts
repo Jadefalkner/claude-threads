@@ -1,3 +1,4 @@
+import { createMockSessionContext as createSharedMockSessionContext } from '../../test-utils/mock-session-context.js';
 import { describe, it, expect, mock, afterEach, afterAll } from 'bun:test';
 
 // `updateSessionHeader` (reached by most command handlers) probes the real
@@ -35,7 +36,11 @@ afterAll(() => {
 // makes this work: hoisted static imports load handler.js transitively before
 // mock.module runs, and Bun retroactively patches the live bindings of
 // already-loaded modules. The mocks apply either way.
-const commands = await import('./handler.js');
+const commands = {
+  ...(await import('./handler.js')),
+  ...(await import('./memory.js')),
+  ...(await import('./automation.js')),
+};
 import type { SessionContext } from '../session-context/index.js';
 import type { Session } from '../../session/types.js';
 import { createSessionTimers, createSessionLifecycle } from '../../session/types.js';
@@ -43,6 +48,7 @@ import type { PlatformClient } from '../../platform/index.js';
 import { createMockFormatter } from '../../test-utils/mock-formatter.js';
 import { MemoryStore } from '../../memory/store.js';
 import { RoutinesStore } from '../../persistence/routines-store.js';
+import { WatchesStore } from '../../persistence/watches-store.js';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -89,6 +95,9 @@ function createMockPlatform(overrides?: Partial<PlatformClient>): PlatformClient
   } as unknown as PlatformClient;
 }
 
+const createMockSessionContext = (sessions: Map<string, Session> = new Map()) =>
+  createSharedMockSessionContext(createMockPlatform, sessions);
+
 /**
  * Create a mock message manager for testing
  */
@@ -104,6 +113,7 @@ function createMockMessageManager(initialApproval?: { postId: string; type: stri
     getPendingQuestionSet: () => pendingQuestionSet,
     clearPendingQuestionSet: () => { pendingQuestionSet = null; },
     setPendingRoutinePrompt: mock(() => {}),
+    setPendingWatchPrompt: mock(() => {}),
   } as any;
 }
 
@@ -160,94 +170,6 @@ function createMockSession(overrides?: Partial<Session> & { pendingApproval?: { 
 /**
  * Create a mock session context
  */
-function createMockSessionContext(sessions: Map<string, Session> = new Map()): SessionContext {
-  return {
-    config: {
-      workingDir: '/test',
-      permissionMode: 'bypass',
-      chromeEnabled: false,
-      debug: false,
-      maxSessions: 5,
-    },
-    state: {
-      sessions,
-      postIndex: new Map(),
-      platforms: new Map([['test-platform', createMockPlatform()]]),
-      sessionStore: {
-        save: mock(() => {}),
-        remove: mock(() => {}),
-        getAll: mock(() => []),
-        get: mock(() => null),
-        cleanStale: mock(() => []),
-        saveStickyPostId: mock(() => {}),
-        getStickyPostId: mock(() => null),
-        load: mock(() => new Map()),
-        findByPostId: mock(() => undefined),
-      } as any,
-      githubEmailsStore: {
-        get: mock(() => undefined),
-        set: mock(() => {}),
-        delete: mock(() => false),
-      } as any,
-      memoryStore: {
-        buildChannelMemoryBlock: mock(() => null),
-        listChannelEntries: mock(() => []),
-        addChannelEntries: mock(() => Promise.resolve({ added: [], duplicates: [], superseded: [] })),
-        forgetChannelEntry: mock(() => Promise.resolve({ ok: false, reason: 'empty', matches: [] })),
-        clearChannel: mock(() => Promise.resolve()),
-        repoMemoryDir: mock(() => '/tmp/test-memory'),
-      } as any,
-      routinesStore: {
-        list: mock(() => []),
-        get: mock(() => undefined),
-        add: mock(() => Promise.resolve({ ok: true, routine: {} })),
-        update: mock(() => Promise.resolve(undefined)),
-        remove: mock(() => Promise.resolve(undefined)),
-      } as any,
-      isShuttingDown: false,
-    },
-    ops: {
-      getSessionId: mock((platformId, threadId) => `${platformId}:${threadId}`),
-      findSessionByThreadId: mock((threadId) => sessions.get(`test-platform:${threadId}`)),
-      registerPost: mock(() => {}),
-      handleEvent: mock(() => {}),
-      handleExit: mock(() => Promise.resolve()),
-      startTyping: mock(() => {}),
-      stopTyping: mock(() => {}),
-      flush: mock(() => Promise.resolve()),
-      updateStickyMessage: mock(() => Promise.resolve()),
-      updateSessionHeader: mock(() => Promise.resolve()),
-      persistSession: mock(() => {}),
-      unpersistSession: mock(() => {}),
-      recordSessionStarted: mock(() => {}),
-      shouldPromptForWorktree: mock(() => Promise.resolve(null)),
-      postWorktreePrompt: mock(() => Promise.resolve()),
-      buildMessageContent: mock((prompt: string) => Promise.resolve({ content: prompt, skipped: [] })),
-      offerContextPrompt: mock(() => Promise.resolve(false)),
-      killSession: mock(() => Promise.resolve()),
-      emitSessionAdd: mock(() => {}),
-      emitSessionUpdate: mock(() => {}),
-      emitSessionRemove: mock(() => {}),
-      registerWorktreeUser: mock(() => {}),
-      unregisterWorktreeUser: mock(() => {}),
-      hasOtherSessionsUsingWorktree: mock(() => false),
-      switchToWorktree: mock(async () => {}),
-      forceUpdate: mock(async () => {}),
-      deferUpdate: mock(() => {}),
-      handleBugReportApproval: mock(async () => {}),
-      acquireClaudeAccount: mock(() => null),
-      getClaudeAccount: mock(() => undefined),
-      releaseClaudeAccount: mock(() => {}),
-      refreshClaudeAccountUsage: mock(async () => {}),
-      markClaudeAccountCooling: mock(() => {}),
-      getClaudeAccountPoolStatus: mock(() => []),
-      getPlatformOverhead: mock(() => ({ sessionHeader: 'full' as const, stickyMessage: 'full' as const })),
-      getPlatformMemoryConfig: mock(() => ({ enabled: false, repoLayer: false, channelLayer: false, distillation: false })),
-      isRoutinesEnabled: mock(() => true),
-      fireRoutineNow: mock(() => Promise.resolve('ok' as const)),
-    },
-  };
-}
 
 // =============================================================================
 // Tests
@@ -1315,6 +1237,30 @@ describe('routine commands', () => {
     expect((session.messageManager as any).setPendingRoutinePrompt).not.toHaveBeenCalled();
   });
 
+  it('createRoutine refuses in direct channel mode (a fired session would be unreachable by text)', async () => {
+    const session = createMockSession();
+    (session.platform as any).directChannelMode = { enabled: true, respondTo: 'all_messages' };
+    const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
+
+    await commands.createRoutine(session, 'every day at 9, do things', 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('direct channel mode'))).toBe(true);
+    expect((session.messageManager as any).setPendingRoutinePrompt).not.toHaveBeenCalled();
+  });
+
+  it('manageRoutines still works in direct channel mode (legacy routines stay manageable)', async () => {
+    const session = createMockSession();
+    (session.platform as any).directChannelMode = { enabled: true, respondTo: 'all_messages' };
+    const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
+    await seedRoutine(ctx);
+
+    await commands.manageRoutines(session, undefined, 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('Routines (1)'))).toBe(true);
+  });
+
   it('createRoutine posts a confirmation card from the parsed schedule', async () => {
     const session = createMockSession();
     const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
@@ -1386,15 +1332,57 @@ describe('routine commands', () => {
     expect(ctx.state.routinesStore.list('test-platform')).toHaveLength(0);
   });
 
+  it('shows the approval posture per row, and it tracks the stored value', async () => {
+    const session = createMockSession();
+    const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
+    const routine = await seedRoutine(ctx); // default posture: approval-required
+
+    await commands.manageRoutines(session, undefined, 'testuser', ctx);
+    let listing = (session.platform.createPost as any).mock.calls
+      .map((c: any[]) => c[0]).find((m: string) => m.includes('Routines (1)'));
+    expect(listing).toContain('👍 approvals');
+    expect(listing).not.toContain('✅ autonomous');
+
+    // Flip to autonomous in the store → the marker follows.
+    await ctx.state.routinesStore.update('test-platform', routine.id, { requireApproval: false });
+    (session.platform.createPost as any).mockClear();
+    await commands.manageRoutines(session, undefined, 'testuser', ctx);
+    listing = (session.platform.createPost as any).mock.calls
+      .map((c: any[]) => c[0]).find((m: string) => m.includes('Routines (1)'));
+    expect(listing).toContain('✅ autonomous');
+  });
+
+  it('!routines approval <n> on|off flips the posture and is owner-gated', async () => {
+    const session = createMockSession();
+    const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
+    const routine = await seedRoutine(ctx);
+    expect(ctx.state.routinesStore.get('test-platform', routine.id)?.requireApproval).toBe(true);
+
+    // A non-owner cannot make a routine autonomous.
+    await commands.manageRoutines(session, 'approval 1 off', 'stranger', ctx);
+    expect(ctx.state.routinesStore.get('test-platform', routine.id)?.requireApproval).toBe(true);
+
+    // The owner can flip it off (autonomous) and back on.
+    await commands.manageRoutines(session, 'approval 1 off', 'testuser', ctx);
+    expect(ctx.state.routinesStore.get('test-platform', routine.id)?.requireApproval).toBe(false);
+    await commands.manageRoutines(session, 'approval 1 on', 'testuser', ctx);
+    expect(ctx.state.routinesStore.get('test-platform', routine.id)?.requireApproval).toBe(true);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('run autonomously'))).toBe(true);
+  });
+
   it('reports unknown indices and bad subcommands', async () => {
     const session = createMockSession();
     const ctx = createRoutinesCtx(new Map([[session.sessionId, session]]));
 
     await commands.manageRoutines(session, 'pause 7', 'testuser', ctx);
     await commands.manageRoutines(session, 'frobnicate 1', 'testuser', ctx);
+    await commands.manageRoutines(session, 'approval 9 off', 'testuser', ctx); // unknown index on the approval path
 
     const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
     expect(calls.some((m: string) => m.includes('No routine 7'))).toBe(true);
+    expect(calls.some((m: string) => m.includes('No routine 9'))).toBe(true);
     expect(calls.some((m: string) => m.includes('Usage'))).toBe(true);
   });
 });
@@ -1464,5 +1452,204 @@ describe('approvals: owner gates on text commands', () => {
     await commands.inviteUser(session, 'newuser', 'someoneelse', ctx);
 
     expect(session.sessionAllowedUsers.has('newuser')).toBe(true);
+  });
+});
+
+describe('watch commands', () => {
+  let watchesRoot: string;
+
+  function createWatchesCtx(sessions: Map<string, Session>, enabled = true): SessionContext {
+    const ctx = createMockSessionContext(sessions);
+    watchesRoot = mkdtempSync(join(tmpdir(), 'ct-watchcmd-test-'));
+    (ctx.state as { watchesStore: unknown }).watchesStore = new WatchesStore(join(watchesRoot, 'watches.yaml'));
+    (ctx.ops as { isWatchesEnabled: unknown }).isWatchesEnabled = mock(() => enabled);
+    return ctx;
+  }
+
+  afterEach(() => {
+    if (watchesRoot) rmSync(watchesRoot, { recursive: true, force: true });
+  });
+
+  async function seedWatch(ctx: SessionContext, name = 'Incident triage') {
+    const result = await ctx.state.watchesStore.add('test-platform', {
+      name,
+      condition: 'someone reports a production incident',
+      prompt: 'triage it',
+      keywords: ['incident', 'outage'],
+      createdBy: 'testuser',
+    });
+    if (!result.ok) throw new Error(result.error);
+    return result.watch;
+  }
+
+  it('explains itself when watches are disabled for the platform', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]), false);
+
+    await commands.manageWatches(session, undefined, 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('disabled'))).toBe(true);
+  });
+
+  it('createWatch is owner-gated', async () => {
+    const session = createMockSession(); // startedBy testuser; isUserAllowed → false
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+
+    await commands.createWatch(session, 'when someone reports an incident, triage it', 'stranger', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('can create watches'))).toBe(true);
+    expect((session.messageManager as any).setPendingWatchPrompt).not.toHaveBeenCalled();
+  });
+
+  it('manageWatches still works in direct channel mode (legacy watches stay manageable)', async () => {
+    // Watches that predate a switch to DCM must stay listable/pausable/
+    // deletable — only creation is refused there.
+    const session = createMockSession();
+    (session.platform as any).directChannelMode = { enabled: true, respondTo: 'all_messages' };
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+    await seedWatch(ctx);
+
+    await commands.manageWatches(session, undefined, 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('Watches (1)'))).toBe(true);
+  });
+
+  it('createWatch refuses in direct channel mode (a saved watch could never fire)', async () => {
+    // The message handler never evaluates watches in DCM (all traffic routes
+    // to the one channel session), so saving here would create a permanently
+    // inert watch behind a success message.
+    const session = createMockSession();
+    (session.platform as any).directChannelMode = { enabled: true, respondTo: 'all_messages' };
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+
+    await commands.createWatch(session, 'when someone reports an incident, triage it', 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('direct channel mode'))).toBe(true);
+    expect((session.messageManager as any).setPendingWatchPrompt).not.toHaveBeenCalled();
+  });
+
+  it('createWatch posts a confirmation card showing condition and keywords', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+
+    // Inject the parse result directly (module-mocking quick-query leaks
+    // across test files; DI is the house pattern).
+    const parse = async () => ({
+      ok: true as const,
+      parsed: {
+        name: 'Incident triage',
+        condition: 'someone reports a production incident',
+        prompt: 'triage it and post a checklist',
+        keywords: ['incident', 'outage', 'down'],
+      },
+    });
+
+    await commands.createWatch(session, 'when someone reports an incident, triage it', 'testuser', ctx, parse);
+
+    const interactive = (session.platform.createInteractivePost as any).mock.calls;
+    expect(interactive).toHaveLength(1);
+    const card = interactive[0][0] as string;
+    expect(card).toContain('Incident triage');
+    expect(card).toContain('someone reports a production incident');
+    expect(card).toContain('incident');
+    expect(card).toContain('semantic check');
+    expect((session.messageManager as any).setPendingWatchPrompt).toHaveBeenCalled();
+  });
+
+  it('createWatch surfaces parse errors without saving anything', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+
+    const parse = async () => ({ ok: false as const, error: 'not a watch request' });
+    await commands.createWatch(session, 'what is the weather', 'testuser', ctx, parse);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('not a watch request'))).toBe(true);
+    expect(ctx.state.watchesStore.list('test-platform')).toHaveLength(0);
+  });
+
+  it('lists watches numbered with condition and creator', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+    await seedWatch(ctx);
+
+    await commands.manageWatches(session, undefined, 'testuser', ctx);
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    const listing = calls.find((m: string) => m.includes('Watches (1)'));
+    expect(listing).toBeDefined();
+    expect(listing).toContain('1. ');
+    expect(listing).toContain('Incident triage');
+    expect(listing).toContain('production incident');
+  });
+
+  it('pause/resume/delete are owner-gated', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+    const watch = await seedWatch(ctx);
+
+    await commands.manageWatches(session, 'pause 1', 'stranger', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.enabled).toBe(true);
+
+    await commands.manageWatches(session, 'pause 1', 'testuser', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.enabled).toBe(false);
+
+    await commands.manageWatches(session, 'resume 1', 'testuser', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.enabled).toBe(true);
+
+    await commands.manageWatches(session, 'delete 1', 'testuser', ctx);
+    expect(ctx.state.watchesStore.list('test-platform')).toHaveLength(0);
+  });
+
+  it('shows the approval posture per row, and it tracks the stored value', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+    const watch = await seedWatch(ctx); // default posture: approval-required
+
+    await commands.manageWatches(session, undefined, 'testuser', ctx);
+    let listing = (session.platform.createPost as any).mock.calls
+      .map((c: any[]) => c[0]).find((m: string) => m.includes('Watches (1)'));
+    expect(listing).toContain('👍 approvals');
+    expect(listing).not.toContain('✅ autonomous');
+
+    await ctx.state.watchesStore.update('test-platform', watch.id, { requireApproval: false });
+    (session.platform.createPost as any).mockClear();
+    await commands.manageWatches(session, undefined, 'testuser', ctx);
+    listing = (session.platform.createPost as any).mock.calls
+      .map((c: any[]) => c[0]).find((m: string) => m.includes('Watches (1)'));
+    expect(listing).toContain('✅ autonomous');
+  });
+
+  it('!watches approval <n> on|off flips the posture and is owner-gated', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+    const watch = await seedWatch(ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.requireApproval).toBe(true);
+
+    // A watch fires on attacker-influenceable content, so a guest must not be
+    // able to strip its approval requirement.
+    await commands.manageWatches(session, 'approval 1 off', 'stranger', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.requireApproval).toBe(true);
+
+    await commands.manageWatches(session, 'approval 1 off', 'testuser', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.requireApproval).toBe(false);
+    await commands.manageWatches(session, 'approval 1 on', 'testuser', ctx);
+    expect(ctx.state.watchesStore.get('test-platform', watch.id)?.requireApproval).toBe(true);
+  });
+
+  it('reports unknown indices and bad subcommands', async () => {
+    const session = createMockSession();
+    const ctx = createWatchesCtx(new Map([[session.sessionId, session]]));
+
+    await commands.manageWatches(session, 'pause 7', 'testuser', ctx);
+    await commands.manageWatches(session, 'run 1', 'testuser', ctx); // no manual run for watches
+
+    const calls = (session.platform.createPost as any).mock.calls.map((c: any[]) => c[0]);
+    expect(calls.some((m: string) => m.includes('No watch 7'))).toBe(true);
+    expect(calls.some((m: string) => m.includes('Usage'))).toBe(true);
   });
 });

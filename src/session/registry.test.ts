@@ -226,7 +226,7 @@ describe('SessionRegistry', () => {
       expect(found).toBeUndefined();
     });
 
-    it('searches across multiple platforms', () => {
+    it('searches across multiple platforms when no platformId is given', () => {
       const session1 = createMockSession({ platformId: 'p1', threadId: 't1' });
       const session2 = createMockSession({ platformId: 'p2', threadId: 't2' });
 
@@ -235,6 +235,26 @@ describe('SessionRegistry', () => {
 
       expect(registry.findByThreadId('t1')).toBe(session1);
       expect(registry.findByThreadId('t2')).toBe(session2);
+    });
+
+    it('scopes to the given platformId (does not cross the platform boundary)', () => {
+      // SECURITY: two platforms with a colliding thread id. A lookup that knows
+      // the message's platform must resolve only that platform's active session,
+      // never the other's (platformId is the store's privacy boundary).
+      const onP1 = createMockSession({ platformId: 'p1', threadId: 'shared' });
+      const onP2 = createMockSession({ platformId: 'p2', threadId: 'shared' });
+      registry.register(onP1);
+      registry.register(onP2);
+
+      expect(registry.findByThreadId('shared', 'p1')).toBe(onP1);
+      expect(registry.findByThreadId('shared', 'p2')).toBe(onP2);
+    });
+
+    it('returns undefined when the thread is active only on a different platform', () => {
+      const onP1 = createMockSession({ platformId: 'p1', threadId: 'shared' });
+      registry.register(onP1);
+
+      expect(registry.findByThreadId('shared', 'p2')).toBeUndefined();
     });
   });
 
@@ -567,11 +587,12 @@ describe('SessionRegistry', () => {
       expect(result).toBeUndefined();
     });
 
-    it('returns soft-deleted sessions too (reply-resume after restart)', () => {
+    it('returns STALE soft-deleted sessions (reply-resume after restart)', () => {
       // Regression: a paused session that cleanStale() soft-deleted at bot
       // startup must still be reachable by threadId so a user reply in the
       // thread can resume it (same guarantee the 🔄 reaction already has).
       const softDeleted: PersistedSession = {
+        endReason: 'stale',
         platformId: 'platform-x',
         threadId: 'target-thread',
         claudeSessionId: 'claude-1',
@@ -601,6 +622,84 @@ describe('SessionRegistry', () => {
       registry = new SessionRegistry(mockStore);
 
       expect(registry.getPersistedByThreadId('target-thread')).toBe(softDeleted);
+    });
+
+    it('hides STOPPED soft-deleted sessions so the thread starts fresh', () => {
+      // The counterpart to the test above, and the fix for a channel that
+      // `!stop` made permanently deaf. This lookup is the gate into the
+      // paused-session branch, and that branch CLAIMS the message — so a
+      // record it returns must be one the resume sink can actually revive.
+      // A stopped session is not: it has already been distilled as ended.
+      // Hiding it lets the message fall through to the new-session path,
+      // which is what `!stop` means to whoever typed it.
+      const stopped: PersistedSession = {
+        endReason: 'stopped',
+        platformId: 'platform-x',
+        threadId: 'target-thread',
+        claudeSessionId: 'claude-1',
+        startedBy: 'user',
+        startedAt: new Date().toISOString(),
+        sessionNumber: 1,
+        workingDir: '/test',
+        sessionAllowedUsers: [],
+        forceInteractivePermissions: false,
+        respondOnlyWhenMentioned: false,
+        sessionStartPostId: null,
+        tasksPostId: null,
+        lastTasksContent: null,
+        lastActivityAt: new Date().toISOString(),
+        planApproved: false,
+        isPaused: false,
+        cleanedAt: new Date().toISOString(),
+      };
+
+      mockStore = createMockSessionStore({
+        load: mock(() => new Map()),
+        findByThreadIdAnyState: mock((id: string) =>
+          id === 'target-thread' ? stopped : undefined
+        ),
+      });
+      registry = new SessionRegistry(mockStore);
+
+      expect(registry.getPersistedByThreadId('target-thread')).toBeUndefined();
+    });
+
+    it('reads a reasonless legacy tombstone as stopped', () => {
+      // Records written before `endReason` existed carry no reason. Reading
+      // them as stopped costs at most one fresh session; reading them as
+      // stale would resurrect conversations their owners ended. `isPaused` is
+      // not a usable substitute — shutdown persists still-active sessions
+      // with `isPaused: false`, so cleanStale() ages those into `false +
+      // cleanedAt` records that ARE revivable.
+      const legacy: PersistedSession = {
+        platformId: 'platform-x',
+        threadId: 'target-thread',
+        claudeSessionId: 'claude-1',
+        startedBy: 'user',
+        startedAt: new Date().toISOString(),
+        sessionNumber: 1,
+        workingDir: '/test',
+        sessionAllowedUsers: [],
+        forceInteractivePermissions: false,
+        respondOnlyWhenMentioned: false,
+        sessionStartPostId: null,
+        tasksPostId: null,
+        lastTasksContent: null,
+        lastActivityAt: new Date().toISOString(),
+        planApproved: false,
+        isPaused: true,
+        cleanedAt: new Date().toISOString(),
+      };
+
+      mockStore = createMockSessionStore({
+        load: mock(() => new Map()),
+        findByThreadIdAnyState: mock((id: string) =>
+          id === 'target-thread' ? legacy : undefined
+        ),
+      });
+      registry = new SessionRegistry(mockStore);
+
+      expect(registry.getPersistedByThreadId('target-thread')).toBeUndefined();
     });
   });
 

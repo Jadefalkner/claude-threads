@@ -8,7 +8,6 @@
  * without the human confirming the parsed result (handled by the caller).
  */
 
-import { quickQuery } from '../claude/quick-query.js';
 import {
   validateSchedule,
   isValidTimezone,
@@ -16,6 +15,7 @@ import {
   type RoutineSchedule,
 } from '../persistence/routines-store.js';
 import { createLogger } from '../utils/logger.js';
+import { singleLine } from '../utils/format.js';
 
 const log = createLogger('routines');
 
@@ -52,23 +52,9 @@ Output ONLY a JSON object, no other text, with exactly these fields:
 If the request is not actually asking for a recurring schedule, output exactly: {"error": "reason"}`;
 }
 
-/**
- * Extract the first JSON object from model output (tolerates chatter or code
- * fences around it). Returns undefined when nothing parses.
- */
-export function extractJsonObject(output: string): Record<string, unknown> | undefined {
-  const start = output.indexOf('{');
-  const end = output.lastIndexOf('}');
-  if (start < 0 || end <= start) return undefined;
-  try {
-    const parsed = JSON.parse(output.slice(start, end + 1)) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
+// Re-exported so existing imports/tests keep working; implementation is shared.
+import { extractJsonObject, parseJsonViaHaiku } from '../claude/llm-json.js';
+export { extractJsonObject };
 
 /**
  * Validate raw parsed fields into a ParsedRoutineRequest. Pure — exported so
@@ -81,8 +67,9 @@ export function validateParsedRoutine(
   if (typeof raw.error === 'string' && raw.error) {
     return { ok: false, error: raw.error };
   }
-  const name = typeof raw.name === 'string' ? raw.name.trim() : '';
-  const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim() : '';
+  // singleLine, not trim: model-authored, rendered verbatim on the card.
+  const name = typeof raw.name === 'string' ? singleLine(raw.name) : '';
+  const prompt = typeof raw.prompt === 'string' ? singleLine(raw.prompt) : '';
   const preset = raw.preset as RoutineSchedule['preset'];
   if (!name) return { ok: false, error: 'could not derive a routine name' };
   if (!prompt) return { ok: false, error: 'could not tell what the routine should do' };
@@ -112,22 +99,15 @@ export function validateParsedRoutine(
  * Parse a natural-language routine request via haiku. Fails with a
  * user-postable error string; never throws.
  */
-export async function parseRoutineRequest(
+export function parseRoutineRequest(
   request: string,
   defaultTimezone = hostTimezone(),
 ): Promise<ParseRoutineResult> {
-  const result = await quickQuery({
+  return parseJsonViaHaiku({
     prompt: buildParsePrompt(request, defaultTimezone),
-    model: 'haiku',
-    timeout: PARSE_TIMEOUT_MS,
+    timeoutMs: PARSE_TIMEOUT_MS,
+    logDebug: (m) => log.debug(`Routine parse: ${m}`),
+    unusableMessage: 'could not understand the schedule — try e.g. "every weekday at 9:00, <task>"',
+    validate: (raw) => validateParsedRoutine(raw, defaultTimezone),
   });
-  if (!result.success || !result.response) {
-    log.debug(`Routine parse quickQuery failed: ${result.error ?? 'no response'}`);
-    return { ok: false, error: 'could not reach the parsing model — try again in a moment' };
-  }
-  const raw = extractJsonObject(result.response);
-  if (!raw) {
-    return { ok: false, error: 'could not understand the schedule — try e.g. "every weekday at 9:00, <task>"' };
-  }
-  return validateParsedRoutine(raw, defaultTimezone);
 }

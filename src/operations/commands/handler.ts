@@ -53,6 +53,7 @@ import {
   updatePostError,
   updatePostCancelled,
 } from '../post-helpers/index.js';
+import { auditCommand, requireSessionOwner } from './guards.js';
 import { createLogger } from '../../utils/logger.js';
 import { createSessionLog } from '../../utils/session-log.js';
 import { formatPullRequestLink } from '../../utils/pr-detector.js';
@@ -68,9 +69,7 @@ import {
   resolveCollaborators,
 } from '../../commands/system-prompt-generator.js';
 import { isValidGitHubNoreplyEmail } from '../../persistence/github-emails-store.js';
-import { resolveSessionMemory, activeWorktreeRepoRoot, MAX_ENTRY_LENGTH, sanitizeEntryText, entryTextExceedsCap } from '../../memory/store.js';
-import { describeSchedule, type Routine } from '../../persistence/routines-store.js';
-import { parseRoutineRequest, hostTimezone } from '../../routines/parser.js';
+import { resolveSessionMemory, activeWorktreeRepoRoot } from '../../memory/store.js';
 
 const log = createLogger('commands');
 const sessionLog = createSessionLog(log);
@@ -99,11 +98,12 @@ function sessionAccountOption(
 function commonRestartCliOptions(
   session: Session,
   ctx: SessionContext,
-): Partial<ClaudeCliOptions> {
+): Partial<ClaudeCliOptions> & Pick<ClaudeCliOptions, 'agentFeatures'> {
   return buildRestartCliOptions(session, {
     chromeEnabled: ctx.config.chromeEnabled,
     permissionTimeoutMs: ctx.config.permissionTimeoutMs,
     account: sessionAccountOption(session, ctx),
+    ops: ctx.ops,
   });
 }
 
@@ -183,43 +183,6 @@ export async function restartClaudeSession(
  * Posts warning message if not authorized.
  * Returns true if authorized, false otherwise.
  */
-
-/** Audit a security-relevant command execution (no-op unless enabled). */
-function auditCommand(session: Session, command: string, detail: string | undefined, username: string): void {
-  auditLog(session.platformId, {
-    threadId: session.threadId,
-    sessionId: session.sessionId,
-    actor: username,
-    kind: 'command',
-    tool: command,
-    detail,
-  });
-}
-
-async function requireSessionOwner(
-  session: Session,
-  username: string,
-  action: string
-): Promise<boolean> {
-  const formatter = session.platform.getFormatter();
-  if (session.startedBy !== username && !session.platform.isUserAllowed(username)) {
-    await post(session, 'warning', `Only ${formatter.formatUserMention(session.startedBy)} or allowed users can ${action}`);
-    sessionLog(session).warn(`Unauthorized: @${username} tried to ${action}`);
-    return false;
-  }
-  // SECURITY: under effective approvals mode `owner`, owner-gated commands
-  // additionally require being a session participant. Without this, any
-  // platform-allowlisted non-participant could `!invite` themselves past the
-  // owner-scoped reaction gate, reducing `owner` to an audit trail.
-  const ownerScoped =
-    resolveApprovals(session.platform.approvals, isDcmThreadId(session.threadId)) === 'owner';
-  if (ownerScoped && !session.sessionAllowedUsers.has(username)) {
-    await post(session, 'warning', `Only session participants can ${action} in this session`);
-    sessionLog(session).warn(`Unauthorized: non-participant @${username} tried to ${action} (approvals: owner)`);
-    return false;
-  }
-  return true;
-}
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -876,398 +839,6 @@ export async function setGitHubEmail(
 }
 
 // ---------------------------------------------------------------------------
-// Channel memory commands (!remember, !memory)
-// ---------------------------------------------------------------------------
-
-/**
- * Guard for the memory commands: posts an explanation and returns false when
- * the platform's channel memory layer is disabled.
- */
-async function requireChannelMemory(session: Session, ctx: SessionContext): Promise<boolean> {
-  const memoryConfig = ctx.ops.getPlatformMemoryConfig(session.platformId);
-  if (memoryConfig.enabled && memoryConfig.channelLayer) return true;
-  await post(
-    session,
-    'info',
-    `🧠 Channel memory is disabled for this platform (see the \`memory\` option in config.yaml).`,
-  );
-  return false;
-}
-
-/**
- * `!remember <text>` — save a note to the channel's shared memory. Any
- * session-authorized user may add entries (authorization is enforced
- * upstream by the executor's `isAllowed` gate).
- *
- * New sessions see the entry immediately; running sessions pick it up on
- * their next respawn/resume.
- */
-export async function rememberEntry(
-  session: Session,
-  text: string,
-  username: string,
-  ctx: SessionContext,
-): Promise<void> {
-  if (!await requireChannelMemory(session, ctx)) return;
-  const formatter = session.platform.getFormatter();
-
-  const sanitized = sanitizeEntryText(text);
-  if (!sanitized) {
-    await post(session, 'warning', `Usage: ${formatter.formatCode('!remember <text>')}`);
-    return;
-  }
-  if (entryTextExceedsCap(text)) {
-    await post(
-      session,
-      'warning',
-      `🧠 Note truncated to ${MAX_ENTRY_LENGTH} characters. For longer content, link to a document instead.`,
-    );
-  }
-
-  const result = await ctx.state.memoryStore.addChannelEntries(session.platformId, [
-    { text: sanitized, source: 'user', addedBy: username },
-  ]);
-  if (result.added.length > 0) {
-    // Never silent about removals: name what the new note replaced.
-    const replaced = result.superseded.length > 0
-      ? ` It replaces ${result.superseded.length === 1
-          ? `an earlier note (${formatter.formatItalic(result.superseded[0].text.substring(0, 120))})`
-          : `${result.superseded.length} earlier notes`}.`
-      : '';
-    await post(
-      session,
-      'success',
-      `🧠 Remembered for this channel.${replaced} ${formatter.formatItalic(`New sessions will see it; view with ${'`!memory`'}.`)}`,
-    );
-    sessionLog(session).info(`🧠 @${username} added a channel memory entry`);
-  } else {
-    await post(session, 'info', `🧠 Already known — an equivalent entry exists. See ${formatter.formatCode('!memory')}.`);
-    sessionLog(session).debug(`🧠 @${username} tried to add a duplicate channel memory entry`);
-  }
-  session.threadLogger?.logCommand('remember', sanitized.substring(0, 80), username);
-}
-
-/**
- * `!memory` — show the channel's shared memory as a numbered list.
- */
-export async function showMemory(
-  session: Session,
-  username: string,
-  ctx: SessionContext,
-): Promise<void> {
-  if (!await requireChannelMemory(session, ctx)) return;
-  const formatter = session.platform.getFormatter();
-
-  const entries = ctx.state.memoryStore.listChannelEntries(session.platformId);
-  if (entries.length === 0) {
-    await post(
-      session,
-      'info',
-      `🧠 No channel memory yet. Add a note with ${formatter.formatCode('!remember <text>')} — it will be shared with every session in this channel.`,
-    );
-    return;
-  }
-
-  const lines = entries.map((e, i) => {
-    // Author as inline code, NOT formatUserMention: a live @mention would
-    // ping every entry author each time anyone views the listing.
-    const source = e.source === 'user' ? formatter.formatCode(`@${e.addedBy ?? 'unknown'}`) : formatter.formatItalic('distilled');
-    return `${i + 1}. [${e.addedAt}] (${source}) ${e.text}`;
-  });
-  const intro = `🧠 ${formatter.formatBold(`Channel memory (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})`)} — shared by all threads in this channel:`;
-  const outro = formatter.formatItalic(`Remove with ${'`!memory forget <number>`'} or ${'`!memory forget <text>`'}; add with ${'`!remember <text>`'}.`);
-
-  // A full channel memory (hundreds of entries, up to ~530 chars per line)
-  // can exceed the platform's post size limit — batch the listing so the
-  // createPost call can't fail on length.
-  const batchBudget = Math.max(
-    1000,
-    session.platform.getMessageLimits().maxLength - intro.length - outro.length - 100,
-  );
-  const batches: string[] = [];
-  let current = '';
-  for (const line of lines) {
-    if (current && current.length + 1 + line.length > batchBudget) {
-      batches.push(current);
-      current = line;
-    } else {
-      current = current ? `${current}\n${line}` : line;
-    }
-  }
-  if (current) batches.push(current);
-
-  for (let i = 0; i < batches.length; i++) {
-    const prefix = i === 0 ? `${intro}\n\n` : '';
-    const suffix = i === batches.length - 1 ? `\n\n${outro}` : '';
-    await post(session, 'info', `${prefix}${batches[i]}${suffix}`);
-  }
-  session.threadLogger?.logCommand('memory', 'show', username);
-}
-
-/**
- * `!memory forget <n|text>` / `!memory forget all` — remove channel memory.
- * Owner-gated like other session-shaping settings: memory is shared channel
- * state, so removal is restricted to the session owner / allowed users.
- *
- * Removal is atomic and applies to all future sessions; sessions already
- * running keep their injected copy until their next respawn.
- */
-export async function forgetMemory(
-  session: Session,
-  selector: string,
-  username: string,
-  ctx: SessionContext,
-): Promise<void> {
-  if (!await requireChannelMemory(session, ctx)) return;
-  if (!await requireSessionOwner(session, username, 'edit channel memory')) {
-    return;
-  }
-  const formatter = session.platform.getFormatter();
-  const trimmed = selector.trim();
-
-  if (trimmed.toLowerCase() === 'all') {
-    const count = ctx.state.memoryStore.listChannelEntries(session.platformId).length;
-    await ctx.state.memoryStore.clearChannel(session.platformId);
-    await post(
-      session,
-      'success',
-      `🧠 Channel memory cleared (${count} ${count === 1 ? 'entry' : 'entries'} removed). Running sessions keep their copy until their next restart.`,
-    );
-    sessionLog(session).info(`🧠 @${username} cleared channel memory (${count} entries)`);
-    auditCommand(session, 'memory', 'forget all', username);
-    session.threadLogger?.logCommand('memory', 'forget all', username);
-    return;
-  }
-
-  const asNumber = /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : undefined;
-  const result = await ctx.state.memoryStore.forgetChannelEntry(
-    session.platformId,
-    asNumber ?? trimmed,
-  );
-
-  if (result.ok) {
-    await post(session, 'success', `🧠 Forgot: ${formatter.formatItalic(result.removed.text)}`);
-    sessionLog(session).info(`🧠 @${username} removed a channel memory entry`);
-    auditCommand(session, 'memory', 'forget', username);
-    session.threadLogger?.logCommand('memory', 'forget', username);
-    return;
-  }
-
-  switch (result.reason) {
-    case 'empty':
-      await post(session, 'info', `🧠 No channel memory to forget.`);
-      break;
-    case 'ambiguous': {
-      // Cap the preview so a broad selector can't blow the post size limit.
-      const MAX_AMBIGUOUS_SHOWN = 10;
-      const shown = result.matches.slice(0, MAX_AMBIGUOUS_SHOWN);
-      const more = result.matches.length > shown.length
-        ? `\n… and ${result.matches.length - shown.length} more`
-        : '';
-      const list = shown.map((e) => `- ${e.text}`).join('\n');
-      await post(
-        session,
-        'warning',
-        `🧠 That matches ${result.matches.length} entries — use ${formatter.formatCode('!memory')} and forget by number instead:\n${list}${more}`,
-      );
-      break;
-    }
-    default:
-      await post(
-        session,
-        'warning',
-        `🧠 No matching entry. Use ${formatter.formatCode('!memory')} to list entries, then ${formatter.formatCode('!memory forget <number>')}.`,
-      );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Routine commands (!routine, !routines)
-// ---------------------------------------------------------------------------
-
-/**
- * Guard for the routine commands: posts an explanation and returns false
- * when routines are disabled for the platform.
- */
-async function requireRoutinesEnabled(session: Session, ctx: SessionContext): Promise<boolean> {
-  if (ctx.ops.isRoutinesEnabled(session.platformId)) return true;
-  await post(
-    session,
-    'info',
-    `🕘 Routines are disabled for this platform (see the \`routines\` option in config.yaml).`,
-  );
-  return false;
-}
-
-/**
- * `!routine <natural language>` — parse the request with haiku, show the
- * structured result, and wait for a 👍/👎 confirmation before saving.
- * Owner-gated like other channel-shaping settings: routines run unattended
- * as their creator and cost a session per run.
- */
-export async function createRoutine(
-  session: Session,
-  request: string,
-  username: string,
-  ctx: SessionContext,
-  // Injectable for tests: other test files module-mock quick-query.js, so
-  // stubbing via CLAUDE_PATH is unreliable in full-suite runs.
-  parse: typeof parseRoutineRequest = parseRoutineRequest,
-): Promise<void> {
-  if (!await requireRoutinesEnabled(session, ctx)) return;
-  if (!await requireSessionOwner(session, username, 'create routines')) return;
-  const formatter = session.platform.getFormatter();
-
-  const trimmed = request.trim();
-  if (!trimmed) {
-    await post(session, 'warning', `Usage: ${formatter.formatCode('!routine every weekday at 9:00, <task>')}`);
-    return;
-  }
-
-  await post(session, 'info', `🕘 Parsing the schedule...`);
-  const result = await parse(trimmed, hostTimezone());
-  if (!result.ok) {
-    await post(session, 'warning', `🕘 Could not create a routine: ${result.error}`);
-    sessionLog(session).warn(`🕘 Routine parse failed for @${username}: ${result.error}`);
-    return;
-  }
-
-  const { parsed, timezoneDefaulted } = result;
-  const tzNote = timezoneDefaulted
-    ? `\n${formatter.formatItalic(`Timezone defaulted to the bot host's ${parsed.schedule.timezone} — name one explicitly ("9am Pacific") to override.`)}`
-    : '';
-  const confirmPost = await postInteractiveAndRegister(
-    session,
-    `🕘 ${formatter.formatBold(`Create routine "${parsed.name}"?`)}\n` +
-    `${formatter.formatBold('Schedule:')} ${describeSchedule(parsed.schedule)}\n` +
-    `${formatter.formatBold('Task:')} ${parsed.prompt}${tzNote}\n\n` +
-    `${formatter.formatItalic('Each run starts a full Claude session in a new thread. React 👍 to save or 👎 to discard.')}`,
-    ['+1', '-1'],
-    (postId, threadId) => ctx.ops.registerPost(postId, threadId),
-  );
-
-  session.messageManager?.setPendingRoutinePrompt({
-    postId: confirmPost.id,
-    parsed,
-    requestedBy: username,
-  });
-  sessionLog(session).info(`🕘 Routine proposal posted for @${username}: "${parsed.name}"`);
-}
-
-/** Resolve a 1-based list index argument to a routine. */
-function routineByIndex(ctx: SessionContext, platformId: string, arg: string): Routine | undefined {
-  if (!/^\d+$/.test(arg)) return undefined;
-  const list = ctx.state.routinesStore.list(platformId);
-  return list[parseInt(arg, 10) - 1];
-}
-
-/**
- * `!routines` — list; `!routines pause|resume|delete <n>` (owner-gated);
- * `!routines run <n>` (platform-allowed users, not !invite'd guests; fires
- * outside the schedule).
- */
-export async function manageRoutines(
-  session: Session,
-  args: string | undefined,
-  username: string,
-  ctx: SessionContext,
-): Promise<void> {
-  if (!await requireRoutinesEnabled(session, ctx)) return;
-  const formatter = session.platform.getFormatter();
-  const platformId = session.platformId;
-  const trimmed = args?.trim();
-
-  if (!trimmed) {
-    const routines = ctx.state.routinesStore.list(platformId);
-    if (routines.length === 0) {
-      await post(
-        session,
-        'info',
-        `🕘 No routines yet. Create one with ${formatter.formatCode('!routine every weekday at 9:00, <task>')}.`,
-      );
-      return;
-    }
-    const lines = routines.map((r, i) => {
-      const status = r.enabled ? '' : ' — ⏸️ paused';
-      const last = r.lastRunAt ? ` · last run ${r.lastRunAt.slice(0, 16).replace('T', ' ')}Z (${r.lastRunStatus})` : '';
-      return `${i + 1}. ${formatter.formatBold(r.name)} — ${describeSchedule(r.schedule)} · by ${formatter.formatCode('@' + r.createdBy)}${status}${last}`;
-    });
-    await post(
-      session,
-      'info',
-      `🕘 ${formatter.formatBold(`Routines (${routines.length})`)} — each run starts a full Claude session in a new thread:\n\n` +
-      `${lines.join('\n')}\n\n` +
-      `${formatter.formatItalic(`Manage with ${'`!routines pause|resume|delete|run <n>`'}.`)}`,
-    );
-    session.threadLogger?.logCommand('routines', 'list', username);
-    return;
-  }
-
-  const match = trimmed.match(/^(pause|resume|delete|run)\s+(\d+)$/i);
-  if (!match) {
-    await post(
-      session,
-      'warning',
-      `🕘 Usage: ${formatter.formatCode('!routines')} or ${formatter.formatCode('!routines pause|resume|delete|run <n>')}`,
-    );
-    return;
-  }
-  const [, action, indexArg] = match;
-  const routine = routineByIndex(ctx, platformId, indexArg);
-  if (!routine) {
-    await post(session, 'warning', `🕘 No routine ${indexArg}. See ${formatter.formatCode('!routines')}.`);
-    return;
-  }
-
-  const lowered = action.toLowerCase();
-  if (lowered !== 'run' && !await requireSessionOwner(session, username, 'manage routines')) {
-    return;
-  }
-  // `run` is open to platform-allowed users but NOT to temporarily !invite'd
-  // guests: each run spawns a full unattended session under the routine
-  // creator's identity, outside the thread the guest was invited to —
-  // session-level allowance must not buy that.
-  if (lowered === 'run' && !session.platform.isUserAllowed(username)) {
-    await post(
-      session,
-      'warning',
-      `🕘 Only platform-allowed users can run routines (${formatter.formatCode('@' + username)} is invited to this session only).`,
-    );
-    return;
-  }
-
-  switch (lowered) {
-    case 'pause':
-      await ctx.state.routinesStore.update(platformId, routine.id, { enabled: false });
-      await post(session, 'success', `⏸️ Routine ${formatter.formatBold(routine.name)} paused.`);
-      break;
-    case 'resume':
-      await ctx.state.routinesStore.update(platformId, routine.id, { enabled: true, consecutiveFailures: 0 });
-      await post(session, 'success', `▶️ Routine ${formatter.formatBold(routine.name)} resumed.`);
-      break;
-    case 'delete':
-      await ctx.state.routinesStore.remove(platformId, routine.id);
-      await post(session, 'success', `🗑️ Routine ${formatter.formatBold(routine.name)} deleted.`);
-      break;
-    case 'run': {
-      await post(session, 'info', `🕘 Running ${formatter.formatBold(routine.name)} now — it will post in a new thread.`);
-      const status = await ctx.ops.fireRoutineNow(platformId, routine);
-      if (status === 'skipped') {
-        await post(session, 'warning', `🕘 Could not run now (session limit reached or platform busy) — try again shortly.`);
-      } else if (status === 'unauthorized') {
-        await post(session, 'warning', `🕘 The routine's creator ${formatter.formatCode('@' + routine.createdBy)} is no longer authorized — routine disabled.`);
-      } else if (status === 'failed') {
-        await post(session, 'warning', `🕘 The run failed to start — check the bot logs.`);
-      }
-      break;
-    }
-  }
-  sessionLog(session).info(`🕘 @${username}: !routines ${lowered} ${indexArg} ("${routine.name}")`);
-  auditCommand(session, 'routines', `${lowered} ${indexArg}`, username);
-  session.threadLogger?.logCommand('routines', `${lowered} ${indexArg}`, username);
-}
-
-// ---------------------------------------------------------------------------
 // Permission management
 // ---------------------------------------------------------------------------
 
@@ -1396,6 +967,7 @@ export async function requestMessageApproval(
     postId: approvalPost.id,
     originalMessage: message,
     fromUser: username,
+    sessionOwner: session.startedBy,
   });
 }
 

@@ -8,6 +8,7 @@
  */
 
 import { isApprovalEmoji, isDenialEmoji, isAllowAllEmoji } from '../../utils/emoji.js';
+import { completePendingPrompt } from './pending-prompt.js';
 import type { ExecutorContext, MessageApprovalState, PendingMessageApproval } from './types.js';
 import { BaseExecutor, type ExecutorOptions } from './base.js';
 
@@ -104,45 +105,33 @@ export class MessageApprovalExecutor extends BaseExecutor<MessageApprovalState> 
    * @param approver - Username of the approver (for logging)
    * @param ctx - Executor context
    */
-  async handleMessageApprovalResponse(
+  handleMessageApprovalResponse(
     postId: string,
     decision: MessageApprovalDecision,
     approver: string,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingMessageApproval) return false;
-    if (this.state.pendingMessageApproval.postId !== postId) return false;
-
-        const { fromUser, originalMessage } = this.state.pendingMessageApproval;
-
-    // Update the post based on decision
-    let statusMessage: string;
-    if (decision === 'allow') {
-      statusMessage = `✅ Message from ${ctx.formatter.formatUserMention(fromUser)} approved by ${ctx.formatter.formatUserMention(approver)}`;
-      ctx.logger.info(`Message from @${fromUser} approved by @${approver}`);
-    } else if (decision === 'invite') {
-      statusMessage = `✅ ${ctx.formatter.formatUserMention(fromUser)} invited to session by ${ctx.formatter.formatUserMention(approver)}`;
-      ctx.logger.info(`@${fromUser} invited to session by @${approver}`);
-    } else {
-      statusMessage = `❌ Message from ${ctx.formatter.formatUserMention(fromUser)} denied by ${ctx.formatter.formatUserMention(approver)}`;
-      ctx.logger.info(`Message from @${fromUser} denied by @${approver}`);
-    }
-
-    try {
-      await ctx.platform.updatePost(postId, statusMessage);
-    } catch (err) {
-      ctx.logger.debug(`Failed to update message approval post: ${err}`);
-    }
-
-    // Clear pending state
-    this.state.pendingMessageApproval = null;
-
-    // Emit message approval complete event
-    if (this.events) {
-      this.events.emit('message-approval:complete', { decision, fromUser, originalMessage, approvedBy: approver });
-    }
-
-    return true;
+    return completePendingPrompt({
+      pending: this.state.pendingMessageApproval,
+      postId,
+      ctx,
+      label: 'message approval',
+      statusMessage: ({ fromUser }) => {
+        if (decision === 'allow') {
+          ctx.logger.info(`Message from @${fromUser} approved by @${approver}`);
+          return `✅ Message from ${ctx.formatter.formatUserMention(fromUser)} approved by ${ctx.formatter.formatUserMention(approver)}`;
+        }
+        if (decision === 'invite') {
+          ctx.logger.info(`@${fromUser} invited to session by @${approver}`);
+          return `✅ ${ctx.formatter.formatUserMention(fromUser)} invited to session by ${ctx.formatter.formatUserMention(approver)}`;
+        }
+        ctx.logger.info(`Message from @${fromUser} denied by @${approver}`);
+        return `❌ Message from ${ctx.formatter.formatUserMention(fromUser)} denied by ${ctx.formatter.formatUserMention(approver)}`;
+      },
+      clear: () => { this.state.pendingMessageApproval = null; },
+      emit: ({ fromUser, originalMessage }) =>
+        this.events?.emit('message-approval:complete', { decision, fromUser, originalMessage, approvedBy: approver }),
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -183,6 +172,35 @@ export class MessageApprovalExecutor extends BaseExecutor<MessageApprovalState> 
         return handled;
       }
       if (isAllowAllEmoji(emoji)) {
+        // "✅ Invite to session" grants standing membership — an owner
+        // privilege, matching the owner-gated `!invite` command. The reaction
+        // router has already confirmed `user` is at least a session
+        // participant, but a temporarily-invited guest is a participant who
+        // must NOT be able to invite further users. Port `requireSessionOwner`'s
+        // first gate here: only the session owner or a platform-allowlisted
+        // user may invite. Anyone else's ✅ is downgraded to a one-shot allow
+        // (the message still goes through once; no permanent membership is
+        // granted). A missing `sessionOwner` (older persisted approval) falls
+        // back to platform-allowlist only.
+        const pending = this.state.pendingMessageApproval;
+        const isInviteAuthorized =
+          (pending.sessionOwner !== undefined && user === pending.sessionOwner) ||
+          ctx.platform.isUserAllowed(user);
+        if (!isInviteAuthorized) {
+          ctx.logger.info(
+            `Message approval invite (✅) from @${user} downgraded to allow-once: only the session owner may invite`
+          );
+          // Tell the reactor their invite was declined and only a one-shot
+          // allow was granted, so a guest who reacted ✅ doesn't wrongly believe
+          // they added the user to the session.
+          await ctx.createPost(
+            `ℹ️ Only the session owner can invite ${ctx.formatter.formatUserMention(pending.fromUser)} to the session — allowing this one message instead.`,
+            { type: 'system' },
+          );
+          const handled = await this.handleMessageApprovalResponse(postId, 'allow', user, ctx);
+          ctx.logger.debug(`MessageApprovalExecutor: outcome=allow (invite downgraded), handled=${handled}`);
+          return handled;
+        }
         ctx.logger.debug(`Message approval reaction from @${user}: invite`);
         const handled = await this.handleMessageApprovalResponse(postId, 'invite', user, ctx);
         ctx.logger.debug(`MessageApprovalExecutor: outcome=invite, handled=${handled}`);

@@ -10,88 +10,9 @@
 
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
 import { PromptExecutor, type ContextPromptSelection, type ExistingWorktreeDecision, type UpdatePromptDecision } from './prompt.js';
+import { createMockPlatform, createTestContext } from '../../test-utils/executor-harness.js';
 import type { ExecutorContext, PendingContextPrompt, PendingExistingWorktreePrompt, PendingUpdatePrompt } from './types.js';
-import type { PlatformClient, PlatformFormatter, PlatformPost } from '../../platform/index.js';
-import { DefaultContentBreaker } from '../content-breaker.js';
-import { PostTracker } from '../post-tracker.js';
 import { createMessageManagerEvents } from '../message-manager-events.js';
-
-// Mock formatter
-const mockFormatter: PlatformFormatter = {
-  formatBold: (text: string) => `**${text}**`,
-  formatItalic: (text: string) => `_${text}_`,
-  formatCode: (text: string) => `\`${text}\``,
-  formatCodeBlock: (text: string, lang?: string) =>
-    lang ? `\`\`\`${lang}\n${text}\n\`\`\`` : `\`\`\`\n${text}\n\`\`\``,
-  formatLink: (text: string, url: string) => `[${text}](${url})`,
-  formatStrikethrough: (text: string) => `~~${text}~~`,
-  formatMarkdown: (text: string) => text,
-  formatUserMention: (userId: string) => `@${userId}`,
-  formatHorizontalRule: () => '---',
-  formatBlockquote: (text: string) => `> ${text}`,
-  formatListItem: (text: string) => `- ${text}`,
-  formatNumberedListItem: (n: number, text: string) => `${n}. ${text}`,
-  formatHeading: (text: string, level: number) => `${'#'.repeat(level)} ${text}`,
-  escapeText: (text: string) => text,
-  formatTable: (_headers: string[], _rows: string[][]) => '',
-  formatKeyValueList: (_items: [string, string, string][]) => '',
-};
-
-// Create mock platform
-function createMockPlatform(): PlatformClient {
-  const posts = new Map<string, { content: string; reactions: string[] }>();
-  let postIdCounter = 0;
-
-  return {
-    getFormatter: () => mockFormatter,
-    createPost: mock(async (content: string, _threadId: string): Promise<PlatformPost> => {
-      const id = `post_${++postIdCounter}`;
-      posts.set(id, { content, reactions: [] });
-      return { id, platformId: 'test', channelId: 'channel-1', message: content, createAt: Date.now(), userId: 'bot' };
-    }),
-    createInteractivePost: mock(async (content: string, reactions: string[], _threadId: string): Promise<PlatformPost> => {
-      const id = `post_${++postIdCounter}`;
-      posts.set(id, { content, reactions });
-      return { id, platformId: 'test', channelId: 'channel-1', message: content, createAt: Date.now(), userId: 'bot' };
-    }),
-    updatePost: mock(async (postId: string, content: string): Promise<void> => {
-      const post = posts.get(postId);
-      if (post) {
-        post.content = content;
-      }
-    }),
-    deletePost: mock(async (_postId: string): Promise<void> => {}),
-    getMessageLimits: () => ({ maxLength: 16000, hardThreshold: 12000 }),
-    pinPost: mock(async () => {}),
-    unpinPost: mock(async () => {}),
-    addReaction: mock(async () => {}),
-    removeReaction: mock(async () => {}),
-  } as unknown as PlatformClient;
-}
-
-// Create context for tests
-function createTestContext(platform?: PlatformClient): ExecutorContext {
-  const p = platform ?? createMockPlatform();
-  const threadId = 'thread-123';
-
-  return {
-    sessionId: 'test:session-1',
-    threadId,
-    platform: p,
-    postTracker: new PostTracker(),
-    contentBreaker: new DefaultContentBreaker(),
-    formatter: mockFormatter,
-    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, debugJson: () => {}, forSession: () => ({} as any) } as any,
-    createPost: async (content, _options) => {
-      const post = await p.createPost(content, threadId);
-      return post;
-    },
-    createInteractivePost: async (content, reactions, _options) => {
-      const post = await p.createInteractivePost(content, reactions, threadId);
-      return post;
-    },
-  };
-}
 
 describe('PromptExecutor', () => {
   let executor: PromptExecutor;
@@ -1139,5 +1060,223 @@ describe('PromptExecutor — routine-creation confirmation', () => {
     const { executor } = setup();
     executor.hydrateState({});
     expect(executor.hasPendingRoutinePrompt()).toBe(false);
+  });
+});
+
+describe('PromptExecutor — creation posture (approvals vs autonomous)', () => {
+  function setup(proposedByAgent = false) {
+    const platform = createMockPlatform();
+    (platform as unknown as { isUserAllowed: (u: string) => boolean }).isUserAllowed =
+      (u: string) => u === 'anne';
+    const ctx = createTestContext(platform);
+    const events = createMessageManagerEvents();
+    const routine: Array<{ approved: boolean; requireApproval?: boolean }> = [];
+    const watch: Array<{ approved: boolean; requireApproval?: boolean }> = [];
+    events.on('routine-prompt:complete', ({ approved, requireApproval }) => routine.push({ approved, requireApproval }));
+    events.on('watch-prompt:complete', ({ approved, requireApproval }) => watch.push({ approved, requireApproval }));
+    const executor = new PromptExecutor({ sessionId: 'test:s', threadId: 't', events } as any);
+    executor.setPendingRoutinePrompt({
+      postId: 'post-r',
+      parsed: { name: 'R', prompt: 'p', schedule: { preset: 'hourly' as const, timezone: 'UTC' } },
+      requestedBy: 'anne',
+      proposedByAgent: proposedByAgent || undefined,
+    });
+    executor.setPendingWatchPrompt({
+      postId: 'post-w',
+      parsed: { name: 'W', condition: 'c', prompt: 'p', keywords: ['k'] },
+      requestedBy: 'anne',
+      proposedByAgent: proposedByAgent || undefined,
+    } as any);
+    return { executor, ctx, routine, watch };
+  }
+
+  it('👍 saves with approvals required (requireApproval=true)', async () => {
+    const { executor, ctx, routine, watch } = setup();
+    await executor.handleReaction('post-r', '+1', 'anne', 'added', ctx);
+    await executor.handleReaction('post-w', '+1', 'anne', 'added', ctx);
+    expect(routine).toEqual([{ approved: true, requireApproval: true }]);
+    expect(watch).toEqual([{ approved: true, requireApproval: true }]);
+  });
+
+  it('✅ saves as autonomous (requireApproval=false) for human creations', async () => {
+    const { executor, ctx, routine, watch } = setup();
+    await executor.handleReaction('post-r', 'white_check_mark', 'anne', 'added', ctx);
+    await executor.handleReaction('post-w', 'white_check_mark', 'anne', 'added', ctx);
+    expect(routine).toEqual([{ approved: true, requireApproval: false }]);
+    expect(watch).toEqual([{ approved: true, requireApproval: false }]);
+  });
+
+  it('✅ on an agent-proposed card never grants autonomy (requireApproval stays true)', async () => {
+    const { executor, ctx, routine, watch } = setup(true);
+    await executor.handleReaction('post-r', 'white_check_mark', 'anne', 'added', ctx);
+    await executor.handleReaction('post-w', 'white_check_mark', 'anne', 'added', ctx);
+    expect(routine).toEqual([{ approved: true, requireApproval: true }]);
+    expect(watch).toEqual([{ approved: true, requireApproval: true }]);
+  });
+
+  it('✅ from a non-owner guest is downgraded to approvals-required', async () => {
+    // Choosing the autonomous (no-approval) posture is an owner privilege. A
+    // guest admitted by the reaction router must not be able to remove the
+    // approval prompts from the owner's item.
+    const { executor, ctx, routine, watch } = setup(); // isUserAllowed = only 'anne'
+    await executor.handleReaction('post-r', 'white_check_mark', 'guest', 'added', ctx);
+    await executor.handleReaction('post-w', 'white_check_mark', 'guest', 'added', ctx);
+    expect(routine).toEqual([{ approved: true, requireApproval: true }]);
+    expect(watch).toEqual([{ approved: true, requireApproval: true }]);
+  });
+
+  it('✅ from a platform-allowlisted non-owner may grant autonomy', async () => {
+    const platform = createMockPlatform();
+    (platform as unknown as { isUserAllowed: (u: string) => boolean }).isUserAllowed =
+      (u: string) => u === 'admin';
+    const ctx = createTestContext(platform);
+    const events = createMessageManagerEvents();
+    const routine: Array<{ approved: boolean; requireApproval?: boolean }> = [];
+    events.on('routine-prompt:complete', ({ approved, requireApproval }) => routine.push({ approved, requireApproval }));
+    const executor = new PromptExecutor({ sessionId: 'test:s', threadId: 't', events } as any);
+    executor.setPendingRoutinePrompt({
+      postId: 'post-r',
+      parsed: { name: 'R', prompt: 'p', schedule: { preset: 'hourly' as const, timezone: 'UTC' } },
+      requestedBy: 'anne',
+    });
+    await executor.handleReaction('post-r', 'white_check_mark', 'admin', 'added', ctx);
+    expect(routine).toEqual([{ approved: true, requireApproval: false }]);
+  });
+
+  it('👎 discards regardless of posture', async () => {
+    const { executor, ctx, routine } = setup();
+    await executor.handleReaction('post-r', '-1', 'anne', 'added', ctx);
+    expect(routine).toEqual([{ approved: false, requireApproval: true }]);
+  });
+});
+
+describe('PromptExecutor — agent-proposal decision gate', () => {
+  function setup() {
+    const platform = createMockPlatform();
+    (platform as unknown as { isUserAllowed: (u: string) => boolean }).isUserAllowed =
+      (u: string) => u === 'allowlisted';
+    const ctx = createTestContext(platform);
+    const events = createMessageManagerEvents();
+    const completions: Array<{ approved: boolean; decidedBy: string }> = [];
+    events.on('routine-prompt:complete', ({ approved, decidedBy }) => {
+      completions.push({ approved, decidedBy });
+    });
+    const executor = new PromptExecutor({
+      sessionId: 'test:session-1',
+      threadId: 'thread-123',
+      events,
+    } as any);
+    executor.setPendingRoutinePrompt({
+      postId: 'post-r1',
+      parsed: {
+        name: 'Standup summary',
+        prompt: 'summarize open threads',
+        schedule: { preset: 'weekdays' as const, time: '09:00', timezone: 'Europe/Amsterdam' },
+      },
+      requestedBy: 'anne',
+      proposedByAgent: true,
+    });
+    return { executor, ctx, completions, platform };
+  }
+
+  it("a non-allowlisted guest's reaction is refused WITHOUT consuming the pending prompt", async () => {
+    // Claude's proposals skip the request-time owner gate, so the decision
+    // is owner-gated instead — and gated BEFORE the pending slot is
+    // consumed: a guest reaction (either way) must not veto the proposal.
+    const { executor, ctx, completions, platform } = setup();
+
+    for (const emoji of ['+1', '-1']) {
+      const handled = await executor.handleReaction('post-r1', emoji, 'guest', 'added', ctx);
+      expect(handled).toBe(true);
+      expect(completions).toHaveLength(0);
+      expect(executor.hasPendingRoutinePrompt()).toBe(true);
+    }
+    const warnings = [...(platform as unknown as { posts: Map<string, { content: string }> }).posts.values()]
+      .filter((p) => p.content.includes('can decide'));
+    // Warn once per pending proposal — a reaction-toggling guest must not
+    // be able to spam the thread.
+    expect(warnings).toHaveLength(1);
+
+    // The owner's later reaction still decides the SAME pending proposal.
+    await executor.handleReaction('post-r1', '+1', 'anne', 'added', ctx);
+    expect(completions).toEqual([{ approved: true, decidedBy: 'anne' }]);
+    expect(executor.hasPendingRoutinePrompt()).toBe(false);
+  });
+
+  it('platform-allowlisted users may decide', async () => {
+    const { executor, ctx, completions } = setup();
+    await executor.handleReaction('post-r1', '-1', 'allowlisted', 'added', ctx);
+    expect(completions).toEqual([{ approved: false, decidedBy: 'allowlisted' }]);
+  });
+
+  it('human-requested cards are untouched by the gate', async () => {
+    const { executor, ctx, completions } = setup();
+    executor.setPendingRoutinePrompt({
+      postId: 'post-r2',
+      parsed: {
+        name: 'Human routine',
+        prompt: 'p',
+        schedule: { preset: 'hourly' as const, timezone: 'UTC' },
+      },
+      requestedBy: 'anne',
+    });
+    await executor.handleReaction('post-r2', '+1', 'guest', 'added', ctx);
+    expect(completions).toEqual([{ approved: true, decidedBy: 'guest' }]);
+  });
+});
+
+describe('PromptExecutor — watch-creation confirmation', () => {
+  function setup() {
+    const platform = createMockPlatform();
+    const ctx = createTestContext(platform);
+    const events = createMessageManagerEvents();
+    const completions: Array<{ approved: boolean; requestedBy: string; decidedBy: string; name: string }> = [];
+    events.on('watch-prompt:complete', ({ approved, parsed, requestedBy, decidedBy }) => {
+      completions.push({ approved, requestedBy, decidedBy, name: parsed.name });
+    });
+    const executor = new PromptExecutor({
+      sessionId: 'test:session-1',
+      threadId: 'thread-123',
+      events,
+    } as any);
+    const parsed = {
+      name: 'Incident triage',
+      condition: 'someone reports a production incident',
+      prompt: 'triage it',
+      keywords: ['incident', 'outage'],
+    };
+    executor.setPendingWatchPrompt({ postId: 'post-w1', parsed, requestedBy: 'anne' });
+    return { executor, ctx, completions };
+  }
+
+  it('👍 approves: emits event with approved=true and clears pending state', async () => {
+    const { executor, ctx, completions } = setup();
+    // The reactor (bob) is not the requester (anne): the payload must carry
+    // BOTH — the audit trail attributes the decision to the reacting user.
+    const handled = await executor.handleReaction('post-w1', '+1', 'bob', 'added', ctx);
+    expect(handled).toBe(true);
+    expect(completions).toEqual([{ approved: true, requestedBy: 'anne', decidedBy: 'bob', name: 'Incident triage' }]);
+    expect(executor.hasPendingWatchPrompt()).toBe(false);
+  });
+
+  it('👎 discards: emits event with approved=false', async () => {
+    const { executor, ctx, completions } = setup();
+    const handled = await executor.handleReaction('post-w1', '-1', 'bob', 'added', ctx);
+    expect(handled).toBe(true);
+    expect(completions).toEqual([{ approved: false, requestedBy: 'anne', decidedBy: 'bob', name: 'Incident triage' }]);
+  });
+
+  it('irrelevant emoji and other posts are ignored', async () => {
+    const { executor, ctx, completions } = setup();
+    expect(await executor.handleReaction('post-w1', 'eyes', 'anne', 'added', ctx)).toBe(false);
+    expect(await executor.handleReaction('other-post', '+1', 'anne', 'added', ctx)).toBe(false);
+    expect(completions).toHaveLength(0);
+    expect(executor.hasPendingWatchPrompt()).toBe(true);
+  });
+
+  it('watch prompts are transient: hydrateState never restores one', () => {
+    const { executor } = setup();
+    executor.hydrateState({});
+    expect(executor.hasPendingWatchPrompt()).toBe(false);
   });
 });

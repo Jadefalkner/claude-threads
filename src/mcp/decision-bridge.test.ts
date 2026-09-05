@@ -2,13 +2,15 @@
  * Tests for the decision bridge — real sockets, both halves.
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, mock } from 'bun:test';
 import {
   DecisionBridgeServer,
   requestBridgeDecision,
+  requestAgentAction,
   bridgeSocketPath,
   type BridgeRequest,
   type BridgeResponse,
+  type AgentActionRequest,
 } from './decision-bridge.js';
 
 const PLAN_REQUEST: BridgeRequest = {
@@ -21,7 +23,7 @@ describe('DecisionBridge', () => {
   it('round-trips an approval decision over a real socket', async () => {
     const seen: BridgeRequest[] = [];
     const server = await DecisionBridgeServer.create(async (req) => {
-      seen.push(req);
+      seen.push(req as BridgeRequest);
       return { behavior: 'allow', updatedInput: req.input };
     });
     try {
@@ -126,6 +128,51 @@ describe('DecisionBridge', () => {
     await server.close();
     await expect(requestBridgeDecision(path, PLAN_REQUEST, 500)).rejects.toThrow();
   });
+
+});
+
+describe('DecisionBridge - agent actions', () => {
+  it('round-trips an agent_action request/response over the same wire', async () => {
+    const seen: AgentActionRequest[] = [];
+    const server = await DecisionBridgeServer.create(async (req) => {
+      seen.push(req as AgentActionRequest);
+      return { ok: true, result: { status: 'saved', echoed: req.input } };
+    });
+    try {
+      const response = await requestAgentAction(
+        server.path,
+        { kind: 'agent_action', action: 'remember_fact', input: { text: 'a fact' } },
+        5000,
+      );
+      expect(response).toEqual({ ok: true, result: { status: 'saved', echoed: { text: 'a fact' } } });
+      expect(seen).toEqual([{ kind: 'agent_action', action: 'remember_fact', input: { text: 'a fact' } }]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('a handler failure surfaces as a response, and a dead path rejects', async () => {
+    const server = await DecisionBridgeServer.create(async () => {
+      throw new Error('store exploded');
+    });
+    try {
+      // Thrown handler errors ride the server's deny-shaped fallback; the
+      // agent client must map that onto the tool contract so the model
+      // always sees { ok: false, reason } — never an ok-less object.
+      const response = await requestAgentAction(
+        server.path,
+        { kind: 'agent_action', action: 'list_memory', input: {} },
+        5000,
+      );
+      expect(response.ok).toBe(false);
+      expect(response.reason).toContain('store exploded');
+    } finally {
+      await server.close();
+    }
+    await expect(
+      requestAgentAction(bridgeSocketPath(), { kind: 'agent_action', action: 'list_memory', input: {} }, 300),
+    ).rejects.toThrow();
+  });
 });
 
 describe('DecisionBridge - client disconnect aborts the handler', () => {
@@ -174,6 +221,47 @@ describe('DecisionBridge - client disconnect aborts the handler', () => {
       const { rm } = await import('node:fs/promises');
       const { join } = await import('node:path');
       await rm(join(path, '..'), { recursive: true, force: true });
+    }
+  });
+});
+
+describe('DecisionBridge - oversize request cap', () => {
+  it('drops a connection that streams more than the request cap without a newline', async () => {
+    const handler = mock(async () => ({ behavior: 'allow' as const }));
+    const server = await DecisionBridgeServer.create(handler);
+    try {
+      const { createConnection } = await import('node:net');
+      // Flood past MAX_BRIDGE_REQUEST_BYTES with no newline, THEN a newline.
+      // With the cap the server severs the connection mid-flood, so no
+      // response can ever arrive; without it the completed giant line would
+      // come back as a "Malformed bridge request" deny. (Bun's client does
+      // not reliably surface the peer destroy while its own write buffer is
+      // full, so the assertion is response-silence, not a close event.)
+      const gotResponse = await new Promise<boolean>((resolve) => {
+        const socket = createConnection(server.path, () => {
+          socket.write('x'.repeat(2 * 1024 * 1024));
+          socket.write('\n');
+        });
+        const timer = setTimeout(() => {
+          socket.destroy();
+          resolve(false);
+        }, 2000);
+        socket.on('data', () => {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on('error', () => {});
+      });
+      expect(gotResponse).toBe(false);
+      expect(handler).not.toHaveBeenCalled();
+
+      // The server survives the flood: a well-formed request on a fresh
+      // connection still round-trips.
+      const decision = await requestBridgeDecision(server.path, PLAN_REQUEST, 2000);
+      expect(decision.behavior).toBe('allow');
+    } finally {
+      await server.close();
     }
   });
 });

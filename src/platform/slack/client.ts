@@ -56,7 +56,6 @@ export class SlackClient extends BasePlatformClient {
   private botToken: string;
   private appToken: string;
   private channelId: string;
-  private skipPermissions: boolean;
   private apiUrl: string;
 
 
@@ -64,6 +63,10 @@ export class SlackClient extends BasePlatformClient {
   private userCache: Map<string, SlackUser> = new Map();
   private usernameToIdCache: Map<string, string> = new Map();
   private botUserId: string | null = null;
+  /** This app's id, learned from the socket (`hello`, then every events_api envelope). */
+  private appId: string | null = null;
+  /** This installation's workspace, from auth.test. */
+  private teamId: string | null = null;
   private botUser: SlackUser | null = null;
   private teamUrl: string | null = null;
 
@@ -84,8 +87,18 @@ export class SlackClient extends BasePlatformClient {
 
   private readonly formatter = new SlackFormatter();
 
-  constructor(platformConfig: SlackPlatformConfig) {
+  // Shared event source: when several SlackClient instances serve one Slack
+  // app, Slack round-robins Socket Mode envelopes across their connections.
+  // Instead, exactly one client (the parent) holds the socket and routes
+  // events for other channels into registered secondary clients.
+  private readonly channelClients = new Map<string, SlackClient>();
+  private sharedEventSource?: SlackClient;
+  private socketConnected = false;
+
+  constructor(platformConfig: SlackPlatformConfig, sharedEventSource?: SlackClient) {
     super();
+    this.sharedEventSource = sharedEventSource;
+    this.installStateMirror();
     this.platformId = platformConfig.id;
     this.displayName = platformConfig.displayName;
     this.botToken = platformConfig.botToken;
@@ -93,12 +106,116 @@ export class SlackClient extends BasePlatformClient {
     this.channelId = platformConfig.channelId;
     this.botName = platformConfig.botName;
     this.allowedUsers = platformConfig.allowedUsers;
-    this.skipPermissions = platformConfig.skipPermissions ?? false;
     this.apiUrl = platformConfig.apiUrl || 'https://slack.com/api';
     this.outboundFiles = platformConfig.outboundFiles;
     this.directChannelMode = resolveDirectChannelMode(platformConfig.directChannelMode);
     this.approvals = platformConfig.approvals;
     this.ackReaction = normalizeAckReaction(platformConfig.ackReaction, `platforms[${platformConfig.id}].ackReaction`);
+  }
+
+  // ============================================================================
+  // Shared event source plumbing
+  // ============================================================================
+
+  /**
+   * A secondary's only event feed is the parent's socket, so the parent's
+   * connection state IS the secondary's connection state — mirror it.
+   *
+   * Stable handler identities, so re-arming is idempotent: overlapping
+   * `disconnect()` calls each clear the listeners and each re-arm, and a
+   * fresh closure per install would leave the mirror stacked and every
+   * later event duplicated into the secondaries.
+   */
+  private readonly stateMirrors = (['connected', 'disconnected', 'reconnecting'] as const).map(
+    (state) => ({
+      state,
+      handler: (...args: unknown[]) => {
+        for (const secondary of this.channelClients.values()) {
+          secondary.emit(state, ...args);
+        }
+      },
+    })
+  );
+
+  private installStateMirror(): void {
+    for (const { state, handler } of this.stateMirrors) {
+      this.off(state, handler);
+      this.on(state, handler);
+    }
+  }
+
+  /**
+   * The parent's socket is every secondary's feed too, so a reconnect means
+   * each of them missed messages as well. `super` clears `isReconnecting`
+   * (after recovering this client's own), so capture it first.
+   */
+  protected override onConnectionEstablished(): void {
+    const wasReconnecting = this.isReconnecting;
+    super.onConnectionEstablished();
+    if (!wasReconnecting) return;
+
+    for (const secondary of this.channelClients.values()) {
+      secondary.recoverMissedMessages().catch((err) => {
+        log.warn(`Failed to recover missed messages for ${secondary.platformId}: ${err}`);
+      });
+    }
+  }
+
+  /**
+   * Parent-side: route events for `channelId` into a secondary client.
+   *
+   * Register secondaries (or call their `connect()`) BEFORE connecting the
+   * parent: events arriving between the parent's socket going live and a
+   * secondary's registration hit the unregistered-channel drop path.
+   */
+  registerChannelClient(channelId: string, client: SlackClient): void {
+    if (channelId === this.channelId) {
+      // Routing requires eventChannel !== this.channelId, so a same-channel
+      // secondary would register fine and then never receive anything.
+      throw new Error(
+        `registerChannelClient: ${channelId} is the parent's own channel — a secondary there can never receive events`
+      );
+    }
+    this.channelClients.set(channelId, client);
+  }
+
+  /**
+   * Parent-side: stop routing events for `channelId`. When `client` is given,
+   * the registration is removed only if it still belongs to that instance —
+   * an old secondary's teardown must not evict its replacement.
+   */
+  unregisterChannelClient(channelId: string, client?: SlackClient): void {
+    if (client && this.channelClients.get(channelId) !== client) return;
+    this.channelClients.delete(channelId);
+  }
+
+  /** Secondary-side: receive an event injected by the parent's socket. */
+  _injectSlackEvent(event: Parameters<SlackClient['handleSlackEvent']>[0], appId?: string | null): void {
+    if (appId) this.appId = appId;
+    this.handleSlackEvent(event);
+  }
+
+  override disconnect(): Promise<void> {
+    // A secondary must stop receiving injected events when it goes away;
+    // the base teardown is still safe to run (it has no socket to close).
+    if (this.sharedEventSource) {
+      this.sharedEventSource.unregisterChannelClient(this.channelId, this);
+    }
+    // Base teardown calls removeAllListeners() synchronously and then returns
+    // the socket-close promise, which can stay pending. Re-arm before that
+    // promise settles: without the mirror, a parent that reconnects while the
+    // close is still in flight emits 'connected' into nothing and its
+    // secondaries miss it permanently.
+    //
+    // Synchronous try/finally, not async: the base promise is returned
+    // unchanged (a synchronous throw stays synchronous) and the mirror is
+    // re-armed on the throwing path too — a failed close must not also leave
+    // the parent permanently mute.
+    try {
+      return super.disconnect();
+    } finally {
+      this.installStateMirror();
+    }
   }
 
   // ============================================================================
@@ -281,6 +398,25 @@ export class SlackClient extends BasePlatformClient {
    * 4. Receive events and ACK within 3 seconds
    */
   async connect(): Promise<void> {
+    // Secondary instance on a shared event source: NEVER open a second Socket
+    // Mode connection — Slack round-robins envelopes across an app's
+    // connections, so a second socket steals events from the parent. The
+    // parent injects events via _injectSlackEvent; Web API calls (which are
+    // plain HTTPS) work independently.
+    if (this.sharedEventSource) {
+      await this.fetchBotUser();
+      // disconnect() may have run while fetchBotUser was in flight — a stale
+      // continuation must not resurrect the registration.
+      if (this.isIntentionalDisconnect) return;
+      this.sharedEventSource.registerChannelClient(this.channelId, this);
+      // Only claim connected while the parent's socket actually is; otherwise
+      // the state mirror emits 'connected' when the parent's hello arrives.
+      if (this.sharedEventSource.socketConnected) {
+        this.emit('connected');
+      }
+      return;
+    }
+
     // First, get bot user info
     await this.fetchBotUser();
     wsLogger.debug(`Slack bot user ID: ${this.botUserId}`);
@@ -341,14 +477,11 @@ export class SlackClient extends BasePlatformClient {
           // Connection established on 'hello'
           if (envelope.type === 'hello') {
             clearTimeout(connectionTimeout);
+            this.socketConnected = true;
+            // Recovery for this channel and for every secondary happens in
+            // onConnectionEstablished — a block here would run after the base
+            // has already cleared isReconnecting, i.e. never.
             this.onConnectionEstablished();
-
-            // Recover missed messages if reconnecting
-            if (this.isReconnecting && this.lastProcessedTs) {
-              this.recoverMissedMessages().catch((err) => {
-                log.warn(`Failed to recover missed messages: ${err}`);
-              });
-            }
 
             doResolve();
           }
@@ -358,6 +491,7 @@ export class SlackClient extends BasePlatformClient {
       };
 
       this.ws.onclose = (event) => {
+        this.socketConnected = false;
         clearTimeout(connectionTimeout);
         wsLogger.info(
           `Socket Mode: WebSocket disconnected (code: ${event.code}, reason: ${event.reason || 'none'}, clean: ${event.wasClean})`
@@ -426,10 +560,37 @@ export class SlackClient extends BasePlatformClient {
       return;
     }
 
+    if (envelope.type === 'hello' && envelope.connection_info?.app_id) {
+      this.appId = envelope.connection_info.app_id;
+    }
+
     // Handle events_api envelopes
     if (envelope.type === 'events_api' && envelope.payload?.event) {
+      if (envelope.payload.api_app_id) this.appId = envelope.payload.api_app_id;
       this.handleSlackEvent(envelope.payload.event);
     }
+  }
+
+  /**
+   * Slack stamps every API-posted message with the posting app's `bot_id` and
+   * `app_id`, including one posted with a *person's* user token of this app
+   * (an integration relaying what the person said). That message is the
+   * person's: `user` is set, `app_id` is ours, `team` is ours. Everything
+   * else with a `bot_id` — our own replies, other apps, classic bots without
+   * a user, and a bot copy of this same app in another workspace sharing a
+   * Slack Connect channel — is bot-authored and ignored. Until app and team
+   * ids are known, the old rule holds.
+   */
+  private isBotAuthored(message: { user?: string; bot_id?: string; app_id?: string; team?: string }): boolean {
+    if (message.user === this.botUserId) return true;
+    if (!message.bot_id) return false;
+    const isOurUserTokenPost = Boolean(
+      this.appId && message.app_id === this.appId && this.teamId && message.team === this.teamId && message.user
+    );
+    if (isOurUserTokenPost) {
+      wsLogger.debug(`Accepting post by ${message.user} made through this app's user token`);
+    }
+    return !isOurUserTokenPost;
   }
 
   /**
@@ -447,13 +608,28 @@ export class SlackClient extends BasePlatformClient {
     item?: { type: string; channel: string; ts: string };
     item_user?: string;
     bot_id?: string;
+    app_id?: string;
+    team?: string;
     files?: SlackFile[];
   }): void {
+    // Shared event source: this socket may carry events for channels owned by
+    // registered secondary clients — hand those over before any own-channel
+    // filtering. Events for unregistered foreign channels keep the existing
+    // behavior (dropped below by the own-channel checks).
+    const eventChannel = event.channel || event.item?.channel;
+    if (eventChannel && eventChannel !== this.channelId) {
+      const secondary = this.channelClients.get(eventChannel);
+      if (secondary) {
+        secondary._injectSlackEvent(event, this.appId);
+        return;
+      }
+    }
+
     // Handle message events
     // Note: file_share subtype is used when a user uploads a file with a message
     if (event.type === 'message' && (!event.subtype || event.subtype === 'file_share')) {
-      // Ignore messages from ourselves
-      if (event.user === this.botUserId || event.bot_id) {
+      // Ignore messages from ourselves and other bots
+      if (this.isBotAuthored(event)) {
         return;
       }
 
@@ -581,32 +757,7 @@ export class SlackClient extends BasePlatformClient {
   protected forceCloseConnection(): Promise<void> {
     const ws = this.ws;
     this.ws = null;
-    if (!ws) return Promise.resolve();
-
-    ws.onopen = null;
-    ws.onmessage = null;
-    ws.onerror = null;
-
-    if (ws.readyState === WebSocket.CLOSED) {
-      ws.onclose = null;
-      return Promise.resolve();
-    }
-
-    return new Promise<void>((resolve) => {
-      const done = () => {
-        ws.onclose = null;
-        resolve();
-      };
-      ws.onclose = done;
-      setTimeout(done, 1000);
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        try {
-          ws.close();
-        } catch {
-          done();
-        }
-      }
-    });
+    return this.closeSocket(ws);
   }
 
   /**
@@ -641,7 +792,7 @@ export class SlackClient extends BasePlatformClient {
 
       for (const message of sortedMessages) {
         // Skip bot messages
-        if (message.user === this.botUserId || message.bot_id) {
+        if (this.isBotAuthored(message)) {
           continue;
         }
 
@@ -672,6 +823,7 @@ export class SlackClient extends BasePlatformClient {
   private async fetchBotUser(): Promise<void> {
     const response = await this.api<AuthTestResponse>('POST', 'auth.test');
     this.botUserId = response.user_id;
+    this.teamId = response.team_id ?? null;
     this.teamUrl = response.url.replace(/\/$/, ''); // Remove trailing slash
 
     // Also fetch full user info
@@ -1020,40 +1172,59 @@ export class SlackClient extends BasePlatformClient {
       // conversations.replies paginates oldest-first, so passing the caller's
       // limit straight to the API would return the OLDEST N messages of a long
       // thread. Callers (context prompt, work summary, memory distillation)
-      // want the most RECENT N — fetch a full page (API max 1000) and apply
-      // the limit after sorting, matching the Mattermost client's behavior.
-      const response = await this.api<ConversationsRepliesResponse>(
-        'GET',
-        `conversations.replies?channel=${this.channelId}&ts=${threadId}&limit=1000`
-      );
+      // want the most RECENT N — walk ALL pages via cursor pagination and
+      // keep a sliding window: trimming to the limit after each page means a
+      // long thread costs API calls but bounded memory, and the walk always
+      // ends at the thread's newest messages. The page cap only bounds a
+      // pathological thread's API cost; hitting it means the END of the
+      // thread was not reached, so the newest messages are missing — say so
+      // honestly instead of claiming the most recent were kept.
+      //
+      // WITHOUT a limit there is no window to slide — the walk would
+      // accumulate every message (and a getUser call each) unbounded. A
+      // no-limit caller (getThreadContextCount) gets exactly one 1000-message
+      // page, the pre-walk behavior.
+      const MAX_PAGES = options?.limit ? 100 : 1; // 100k messages — API-cost bound, not a memory bound
+      let filtered: SlackMessage[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+        const response = await this.api<ConversationsRepliesResponse>(
+          'GET',
+          `conversations.replies?channel=${this.channelId}&ts=${threadId}&limit=1000${cursorParam}`
+        );
+        for (const msg of response.messages || []) {
+          if (options?.excludeBotMessages && this.isBotAuthored(msg)) continue;
+          filtered.push(msg);
+        }
+        // Sliding window: each page arrives oldest-first, so after sorting,
+        // trimming from the front keeps the newest seen so far.
+        filtered.sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+        if (options?.limit && filtered.length > options.limit) {
+          filtered = filtered.slice(-options.limit);
+        }
+        cursor = response.response_metadata?.next_cursor || undefined;
+        if (!cursor) break;
+        if (page === MAX_PAGES - 1 && options?.limit) {
+          // Only the limited walk promises "the newest N" — stopping short
+          // there is real context loss. The no-limit single page is the
+          // documented intent, not an early stop worth alarming about.
+          log.warn(`Thread ${threadId} exceeds ${MAX_PAGES * 1000} messages — walk stopped early, the NEWEST messages are missing from context`);
+        }
+      }
+
+      const kept = filtered;
 
       const messages: ThreadMessage[] = [];
-
-      for (const msg of response.messages || []) {
-        // Skip bot messages if requested
-        if (options?.excludeBotMessages && (msg.user === this.botUserId || msg.bot_id)) {
-          continue;
-        }
-
-        // Get username from cache or fetch
+      for (const msg of kept) {
         const user = await this.getUser(msg.user || '');
-        const username = user?.username || 'unknown';
-
         messages.push({
           id: msg.ts,
           userId: msg.user || '',
-          username,
+          username: user?.username || 'unknown',
           message: msg.text,
           createAt: Math.floor(parseFloat(msg.ts) * 1000),
         });
-      }
-
-      // Sort by timestamp (oldest first)
-      messages.sort((a, b) => a.createAt - b.createAt);
-
-      // Apply limit (most recent N), like the Mattermost client
-      if (options?.limit && messages.length > options.limit) {
-        return messages.slice(-options.limit);
       }
       return messages;
     } catch (err) {

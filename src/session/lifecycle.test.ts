@@ -1,10 +1,11 @@
+import { createMockSessionContext as createSharedMockSessionContext } from '../test-utils/mock-session-context.js';
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import * as lifecycle from './lifecycle.js';
-import type { SessionContext } from '../operations/session-context/index.js';
+import * as metadataSuggestions from './metadata-suggestions.js';
 import type { Session } from './types.js';
 import { createSessionTimers, createSessionLifecycle, createResumedLifecycle } from './types.js';
 import type { PlatformClient } from '../platform/index.js';
@@ -49,6 +50,9 @@ function createMockPlatform(overrides?: Partial<PlatformClient>): PlatformClient
     ...overrides,
   } as unknown as PlatformClient;
 }
+
+const createMockSessionContext = (sessions: Map<string, Session> = new Map()) =>
+  createSharedMockSessionContext(createMockPlatform, sessions);
 
 /**
  * Create a mock message manager for testing
@@ -163,94 +167,6 @@ function createMockSession(overrides?: Partial<Session> & {
 /**
  * Create a mock session context
  */
-function createMockSessionContext(sessions: Map<string, Session> = new Map()): SessionContext {
-  return {
-    config: {
-      workingDir: '/test',
-      permissionMode: 'bypass',
-      chromeEnabled: false,
-      debug: false,
-      maxSessions: 5,
-    },
-    state: {
-      sessions,
-      postIndex: new Map(),
-      platforms: new Map([['test-platform', createMockPlatform()]]),
-      sessionStore: {
-        save: mock(() => {}),
-        remove: mock(() => {}),
-        getAll: mock(() => []),
-        get: mock(() => null),
-        cleanStale: mock(() => []),
-        saveStickyPostId: mock(() => {}),
-        getStickyPostId: mock(() => null),
-        load: mock(() => new Map()),
-        findByPostId: mock(() => undefined),
-      } as any,
-      githubEmailsStore: {
-        get: mock(() => undefined),
-        set: mock(() => {}),
-        delete: mock(() => false),
-      } as any,
-      memoryStore: {
-        buildChannelMemoryBlock: mock(() => null),
-        listChannelEntries: mock(() => []),
-        addChannelEntries: mock(() => Promise.resolve({ added: [], duplicates: [], superseded: [] })),
-        forgetChannelEntry: mock(() => Promise.resolve({ ok: false, reason: 'empty', matches: [] })),
-        clearChannel: mock(() => Promise.resolve()),
-        repoMemoryDir: mock(() => '/tmp/test-memory'),
-      } as any,
-      routinesStore: {
-        list: mock(() => []),
-        get: mock(() => undefined),
-        add: mock(() => Promise.resolve({ ok: true, routine: {} })),
-        update: mock(() => Promise.resolve(undefined)),
-        remove: mock(() => Promise.resolve(undefined)),
-      } as any,
-      isShuttingDown: false,
-    },
-    ops: {
-      getSessionId: mock((platformId, threadId) => `${platformId}:${threadId}`),
-      findSessionByThreadId: mock((threadId) => sessions.get(`test-platform:${threadId}`)),
-      registerPost: mock(() => {}),
-      handleEvent: mock(() => {}),
-      handleExit: mock(() => Promise.resolve()),
-      startTyping: mock(() => {}),
-      stopTyping: mock(() => {}),
-      flush: mock(() => Promise.resolve()),
-      updateStickyMessage: mock(() => Promise.resolve()),
-      updateSessionHeader: mock(() => Promise.resolve()),
-      persistSession: mock(() => {}),
-      unpersistSession: mock(() => {}),
-      recordSessionStarted: mock(() => {}),
-      shouldPromptForWorktree: mock(() => Promise.resolve(null)),
-      postWorktreePrompt: mock(() => Promise.resolve()),
-      buildMessageContent: mock((prompt: string) => Promise.resolve({ content: prompt, skipped: [] })),
-      offerContextPrompt: mock(() => Promise.resolve(false)),
-      killSession: mock(() => Promise.resolve()),
-      emitSessionAdd: mock(() => {}),
-      emitSessionUpdate: mock(() => {}),
-      emitSessionRemove: mock(() => {}),
-      registerWorktreeUser: mock(() => {}),
-      unregisterWorktreeUser: mock(() => {}),
-      hasOtherSessionsUsingWorktree: mock(() => false),
-      switchToWorktree: mock(async () => {}),
-      forceUpdate: mock(async () => {}),
-      deferUpdate: mock(() => {}),
-      handleBugReportApproval: mock(async () => {}),
-      acquireClaudeAccount: mock(() => null),
-      getClaudeAccount: mock(() => undefined),
-      releaseClaudeAccount: mock(() => {}),
-      refreshClaudeAccountUsage: mock(async () => {}),
-      markClaudeAccountCooling: mock(() => {}),
-      getClaudeAccountPoolStatus: mock(() => []),
-      getPlatformOverhead: mock(() => ({ sessionHeader: 'full' as const, stickyMessage: 'full' as const })),
-      getPlatformMemoryConfig: mock(() => ({ enabled: false, repoLayer: false, channelLayer: false, distillation: false })),
-      isRoutinesEnabled: mock(() => true),
-      fireRoutineNow: mock(() => Promise.resolve('ok' as const)),
-    },
-  };
-}
 
 // =============================================================================
 // Tests
@@ -489,7 +405,7 @@ describe('maybeInjectMetadataReminder', () => {
     const message = 'Hello';
     const session = { messageCount: 1 };
 
-    const result = lifecycle.maybeInjectMetadataReminder(message, session);
+    const result = metadataSuggestions.maybeInjectMetadataReminder(message, session);
 
     expect(result).toBe('Hello');
   });
@@ -498,7 +414,7 @@ describe('maybeInjectMetadataReminder', () => {
     const message = 'Hello';
     const session = { messageCount: 2 };
 
-    const result = lifecycle.maybeInjectMetadataReminder(message, session);
+    const result = metadataSuggestions.maybeInjectMetadataReminder(message, session);
 
     expect(result).toBe('Hello');
   });
@@ -507,15 +423,15 @@ describe('maybeInjectMetadataReminder', () => {
     const message = 'Hello';
 
     // 5th message - still returns unchanged (just fires reclassification in background)
-    const result5 = lifecycle.maybeInjectMetadataReminder(message, { messageCount: 5 });
+    const result5 = metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 5 });
     expect(result5).toBe('Hello');
 
     // 10th message - same behavior
-    const result10 = lifecycle.maybeInjectMetadataReminder(message, { messageCount: 10 });
+    const result10 = metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 10 });
     expect(result10).toBe('Hello');
 
     // 15th message - same behavior
-    const result15 = lifecycle.maybeInjectMetadataReminder(message, { messageCount: 15 });
+    const result15 = metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 15 });
     expect(result15).toBe('Hello');
   });
 
@@ -523,10 +439,10 @@ describe('maybeInjectMetadataReminder', () => {
     const message = 'Hello';
 
     // All messages should return unchanged
-    expect(lifecycle.maybeInjectMetadataReminder(message, { messageCount: 3 })).toBe('Hello');
-    expect(lifecycle.maybeInjectMetadataReminder(message, { messageCount: 4 })).toBe('Hello');
-    expect(lifecycle.maybeInjectMetadataReminder(message, { messageCount: 6 })).toBe('Hello');
-    expect(lifecycle.maybeInjectMetadataReminder(message, { messageCount: 7 })).toBe('Hello');
+    expect(metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 3 })).toBe('Hello');
+    expect(metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 4 })).toBe('Hello');
+    expect(metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 6 })).toBe('Hello');
+    expect(metadataSuggestions.maybeInjectMetadataReminder(message, { messageCount: 7 })).toBe('Hello');
   });
 });
 
@@ -807,7 +723,7 @@ describe('attemptMetadataFetch', () => {
     const sessions = new Map([['test-platform:thread-123', session]]);
     const ctx = createMockSessionContext(sessions);
 
-    const result = await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    const result = await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => ({
         title: 'Test Title',
         description: 'Test Description',
@@ -832,7 +748,7 @@ describe('attemptMetadataFetch', () => {
     const sessions = new Map([['test-platform:thread-123', session]]);
     const ctx = createMockSessionContext(sessions);
 
-    const result = await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    const result = await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => null,
       suggestTags: async () => ['feature'],
     });
@@ -853,7 +769,7 @@ describe('attemptMetadataFetch', () => {
     const sessions = new Map([['test-platform:thread-123', session]]);
     const ctx = createMockSessionContext(sessions);
 
-    const result = await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    const result = await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => ({
         title: 'Success Title',
         description: 'Success Desc',
@@ -878,7 +794,7 @@ describe('attemptMetadataFetch', () => {
     const ctx = createMockSessionContext(sessions);
 
     // Even if suggestions fail, existing metadata counts as success
-    const result = await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    const result = await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => null,
       suggestTags: async () => [],
     });
@@ -897,7 +813,7 @@ describe('attemptMetadataFetch', () => {
     const sessions = new Map<string, Session>();
     const ctx = createMockSessionContext(sessions);
 
-    const result = await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    const result = await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => ({
         title: 'Title',
         description: 'Desc',
@@ -920,7 +836,7 @@ describe('attemptMetadataFetch', () => {
     const sessions = new Map([['test-platform:thread-123', session]]);
     const ctx = createMockSessionContext(sessions);
 
-    await lifecycle.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
+    await metadataSuggestions.attemptMetadataFetch(session, 'test prompt', ctx, 1, {
       suggestMetadata: async () => ({
         title: 'New Title',
         description: 'New Desc',
@@ -1366,7 +1282,7 @@ describe('authorization gate at sinks (#388)', () => {
     it('does not resume for an unauthorized user (no Claude account acquired)', async () => {
       const ctx = contextWithPersisted(persistedState());
 
-      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'jonas.gn');
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'jonas.gn', 'test-platform');
 
       // resumeSession (reached only past the gate) acquires a Claude account.
       expect(ctx.ops.acquireClaudeAccount).not.toHaveBeenCalled();
@@ -1375,7 +1291,7 @@ describe('authorization gate at sinks (#388)', () => {
     it('proceeds past the gate for the session owner', async () => {
       const ctx = contextWithPersisted(persistedState());
 
-      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice');
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
 
       // Owner clears the gate, so resumeSession runs and acquires an account.
       expect(ctx.ops.acquireClaudeAccount).toHaveBeenCalled();
@@ -1386,9 +1302,141 @@ describe('authorization gate at sinks (#388)', () => {
         persistedState({ sessionAllowedUsers: ['alice', 'invited'] }),
       );
 
-      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'invited');
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'invited', 'test-platform');
 
       expect(ctx.ops.acquireClaudeAccount).toHaveBeenCalled();
+    });
+
+    it('does not resume a session from another platform (cross-platform threadId collision)', async () => {
+      // SECURITY regression: a session lives under platform-a. A message
+      // arrives on platform-b whose threadId collides. The resume sink must be
+      // scoped to the message's platform — without scoping, platform-b's
+      // message would resume platform-a's session (importing its allowlist,
+      // working dir, worktree and Claude account), and the authorization check
+      // would run against platform-a's allowlist instead of platform-b's.
+      const platformA = createMockPlatform({
+        isUserAllowed: mock((u: string) => u === 'alice') as any,
+        getPost: mock(() => Promise.resolve({ id: 'shared-thread' })) as any,
+      });
+      const ctx = createMockSessionContext(new Map());
+      (ctx.state.platforms as Map<string, PlatformClient>).set('platform-a', platformA);
+      (ctx.state.sessionStore.load as any).mockReturnValue(
+        new Map([[
+          'platform-a:shared-thread',
+          persistedState({ threadId: 'shared-thread', platformId: 'platform-a' }),
+        ]]),
+      );
+
+      // Alice is authorized on platform-a; the message arrives on platform-b.
+      await lifecycle.resumePausedSession('shared-thread', 'continue', undefined, ctx, 'alice', 'platform-b');
+
+      // Scoped out: no session resolves for platform-b, so nothing is resumed.
+      // (Without the platformId scope, platform-a's session would be found and
+      // resumed here — acquireClaudeAccount would be called.)
+      expect(ctx.ops.acquireClaudeAccount).not.toHaveBeenCalled();
+    });
+
+    // -----------------------------------------------------------------------
+    // Regression: the trapped-thread bug.
+    //
+    // `registry.getPersistedByThreadId()` deliberately returns SOFT-DELETED
+    // records so a plain reply can revive a session `cleanStale()` tombstoned
+    // at startup (see registry.test.ts, "returns soft-deleted sessions too").
+    // That gate is what routes a message into the paused-session branch.
+    //
+    // But this sink resolved its state through `load()`, which SKIPS records
+    // with `cleanedAt`. So the two lookups disagreed: the gate said "a paused
+    // session lives here", the sink said "No persisted session found" and
+    // returned — silently. The thread was then unreachable in both
+    // directions: the paused branch owns the message, so the new-session path
+    // never runs either.
+    //
+    // In a DCM channel, where the channel IS the session, that is terminal:
+    // `!stop` soft-deletes the record and nothing can ever start a session in
+    // that channel again. Observed 2026-09-05 and reproduced on demand.
+    // -----------------------------------------------------------------------
+    function contextWithTombstone(state: Record<string, unknown>) {
+      const platform = createMockPlatform({
+        isUserAllowed: mock((u: string) => u === 'alice') as any,
+        getPost: mock(() => Promise.resolve({ id: 'thread-paused' })) as any,
+      });
+      const ctx = createMockSessionContext(new Map());
+      (ctx.state.platforms as Map<string, PlatformClient>).set('test-platform', platform);
+      // The real store's asymmetry, mocked exactly: load() hides it, the
+      // raw scan still returns it.
+      (ctx.state.sessionStore.load as any).mockReturnValue(new Map());
+      (ctx.state.sessionStore.findByThreadIdAnyState as any).mockImplementation(
+        (threadId: string, platformId?: string) =>
+          threadId === state.threadId && (platformId === undefined || platformId === state.platformId)
+            ? state
+            : undefined,
+      );
+      return ctx;
+    }
+
+    it('resumes a soft-deleted record instead of dropping the message', async () => {
+      const ctx = contextWithTombstone(
+        persistedState({ isPaused: true, cleanedAt: new Date().toISOString(), endReason: 'stale' }),
+      );
+
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
+
+      // Before the fix this returned at "No persisted session found".
+      expect(ctx.ops.acquireClaudeAccount).toHaveBeenCalled();
+    });
+
+    it('clears the tombstone it resurrected, so the record stops being half-dead', async () => {
+      const state = persistedState({ isPaused: true, cleanedAt: new Date().toISOString(), endReason: 'stale' });
+      const ctx = contextWithTombstone(state);
+
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
+
+      // Leaving `cleanedAt` set would put the record straight back into the
+      // state where load() hides it — reviving the thread for exactly one
+      // message and then trapping it again on the next restart.
+      expect((state as { cleanedAt?: string }).cleanedAt).toBeUndefined();
+    });
+
+    it('writes the revived record back to the store, not just the object', async () => {
+      // Clearing the field in memory is not enough: a restart before the next
+      // save would reload the tombstone from disk and trap the thread again.
+      const state = persistedState({ isPaused: true, cleanedAt: new Date().toISOString(), endReason: 'stale' });
+      const ctx = contextWithTombstone(state);
+
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
+
+      const saved = (ctx.state.sessionStore.save as any).mock.calls
+        .find(([id]: [string]) => id === 'test-platform:thread-paused');
+      expect(saved).toBeDefined();
+      expect(saved[1].cleanedAt).toBeUndefined();
+      // The pair is written together and must be cleared together, or the
+      // record keeps a reason for an ending that no longer happened.
+      expect(saved[1].endReason).toBeUndefined();
+    });
+
+    it('does not revive the tombstone for a refused user', async () => {
+      // The write-back sits after the #388 gate on purpose: a refused resume
+      // must not launder a soft-deleted session back into the visible set.
+      const state = persistedState({ isPaused: true, cleanedAt: new Date().toISOString(), endReason: 'stale' });
+      const ctx = contextWithTombstone(state);
+
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'jonas.gn', 'test-platform');
+
+      expect((state as { cleanedAt?: string }).cleanedAt).toBeDefined();
+      expect(ctx.state.sessionStore.save).not.toHaveBeenCalled();
+    });
+
+    it('still refuses an unauthorized user when the record is soft-deleted', async () => {
+      // Resurrecting a tombstone must not become a way around the #388
+      // identity gate: the authorization check runs on the same state either
+      // way.
+      const ctx = contextWithTombstone(
+        persistedState({ isPaused: true, cleanedAt: new Date().toISOString(), endReason: 'stale' }),
+      );
+
+      await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'jonas.gn', 'test-platform');
+
+      expect(ctx.ops.acquireClaudeAccount).not.toHaveBeenCalled();
     });
   });
 });
@@ -1507,7 +1555,7 @@ describe('userAttribution flag seeding', () => {
   it('seeds userAttribution from persisted state on resume', async () => {
     const ctx = resumeCtx({ userAttribution: true });
 
-    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice');
+    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
 
     const added = (ctx.ops.emitSessionAdd as any).mock.calls[0]?.[0] as Session;
     expect(added.userAttribution).toBe(true);
@@ -1516,7 +1564,7 @@ describe('userAttribution flag seeding', () => {
   it('reads absent persisted userAttribution as false (pre-flag sessions.json)', async () => {
     const ctx = resumeCtx({});
 
-    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice');
+    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'alice', 'test-platform');
 
     const added = (ctx.ops.emitSessionAdd as any).mock.calls[0]?.[0] as Session;
     expect(added.userAttribution).toBe(false);
@@ -1533,7 +1581,18 @@ describe('resumePausedSession sender attribution (regression)', () => {
       isUserAllowed: mock((u: string) => u === 'alice') as any,
       getPost: mock(() => Promise.resolve({ id: 'thread-paused' })) as any,
     });
-    const ctx = createMockSessionContext(new Map());
+    // resumeSession's internal ClaudeCli.start() throws in this mock
+    // environment (no real platformConfig), so the session it builds gets
+    // rolled back out of the registry before resumePausedSession looks it
+    // up. Seed the sessions map under the COMPOSITE key with a mock session
+    // (and a mock messageManager) so handleUserMessage's call args are
+    // observable — that map, keyed `platformId:threadId`, is the same seam
+    // resumePausedSession queries to find the session to message.
+    const mockMsgManager = createMockMessageManager();
+    const mockSession = createMockSession({ messageManager: mockMsgManager as any });
+    const ctx = createMockSessionContext(
+      new Map([['test-platform:thread-paused', mockSession]]),
+    );
     (ctx.state.platforms as Map<string, PlatformClient>).set('test-platform', platform);
     (ctx.state.sessionStore.load as any).mockReturnValue(
       new Map([['test-platform:thread-paused', {
@@ -1546,18 +1605,7 @@ describe('resumePausedSession sender attribution (regression)', () => {
       }]]),
     );
 
-    // resumeSession's internal ClaudeCli.start() throws in this mock
-    // environment (no real platformConfig), so the session it builds gets
-    // rolled back out of the registry before resumePausedSession looks it
-    // up. Wire findSessionByThreadId directly to a mock session (with a
-    // mock messageManager) so handleUserMessage's call args are
-    // observable — this is the same seam resumePausedSession itself
-    // queries to find the session to message.
-    const mockMsgManager = createMockMessageManager();
-    const mockSession = createMockSession({ messageManager: mockMsgManager as any });
-    (ctx.ops.findSessionByThreadId as any).mockReturnValue(mockSession);
-
-    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'bob');
+    await lifecycle.resumePausedSession('thread-paused', 'continue', undefined, ctx, 'bob', 'test-platform');
 
     expect(mockMsgManager.handleUserMessage).toHaveBeenCalledTimes(1);
     const sender = (mockMsgManager.handleUserMessage as any).mock.calls[0][2];

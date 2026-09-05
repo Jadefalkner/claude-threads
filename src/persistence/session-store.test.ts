@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { writeFileSync, mkdirSync, existsSync, unlinkSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { SessionStore, PersistedSession } from './session-store.js';
@@ -207,7 +207,7 @@ describe('SessionStore', () => {
       });
       const sessionId = 'mattermost-main:thread-xyz';
       store.save(sessionId, session);
-      store.softDelete(sessionId);
+      store.softDelete(sessionId, 'stopped');
 
       // load() hides it — that's by design for auto-resume on startup.
       expect(store.load().size).toBe(0);
@@ -224,11 +224,30 @@ describe('SessionStore', () => {
       expect(store.findByThreadIdAnyState('thread-b')).toBeUndefined();
     });
 
-    it('searches across platforms (returns first match)', () => {
+    it('searches across platforms when no platformId is given (returns first match)', () => {
       const mm = createTestSession({ platformId: 'mattermost-main', threadId: 'shared-id' });
       store.save('mattermost-main:shared-id', mm);
       const found = store.findByThreadIdAnyState('shared-id');
       expect(found?.platformId).toBe('mattermost-main');
+    });
+
+    it('scopes to the given platformId (does not cross the platform boundary)', () => {
+      // Two sessions on different platforms share a thread id. A caller that
+      // knows the message's platform must resolve only that platform's session,
+      // never leak the other platform's allowlist/working-dir/account.
+      const mm = createTestSession({ platformId: 'mattermost-main', threadId: 'shared-id' });
+      const slack = createTestSession({ platformId: 'slack-ws', threadId: 'shared-id' });
+      store.save('mattermost-main:shared-id', mm);
+      store.save('slack-ws:shared-id', slack);
+
+      expect(store.findByThreadIdAnyState('shared-id', 'slack-ws')?.platformId).toBe('slack-ws');
+      expect(store.findByThreadIdAnyState('shared-id', 'mattermost-main')?.platformId).toBe('mattermost-main');
+    });
+
+    it('returns undefined when the thread exists only under a different platform', () => {
+      const mm = createTestSession({ platformId: 'mattermost-main', threadId: 'shared-id' });
+      store.save('mattermost-main:shared-id', mm);
+      expect(store.findByThreadIdAnyState('shared-id', 'slack-ws')).toBeUndefined();
     });
   });
 
@@ -240,7 +259,7 @@ describe('SessionStore', () => {
       store.save(sessionId, session);
       expect(store.load().size).toBe(1);
 
-      store.softDelete(sessionId);
+      store.softDelete(sessionId, 'stopped');
 
       // Should not appear in load() (active sessions)
       expect(store.load().size).toBe(0);
@@ -280,6 +299,42 @@ describe('SessionStore', () => {
       expect(history[0].threadId).toBe('old-thread');
     });
 
+    it('never tombstones a DCM session, however idle (fixes #499)', () => {
+      // A thread session and a channel session, both well past the age limit.
+      // The thread one is aged out as always; the DCM one must survive.
+      //
+      // The asymmetry is the point. A tombstoned thread session costs nothing
+      // — the next message opens a new thread and starts fresh. A DCM session
+      // IS its channel, so tombstoning it leaves nowhere else to go: every
+      // later message dies in `resumePausedSession` on "No persisted session
+      // found" (a DEBUG line, no reply), and the channel is unusable until
+      // someone edits sessions.json on the host. Idle age is the wrong owner
+      // for that lifecycle; the channel's own archive/teardown is the right
+      // one.
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      const threadSession = createTestSession({
+        threadId: 'idle-thread',
+        lastActivityAt: twoHoursAgo,
+      });
+      const channelSession = createTestSession({
+        threadId: 'dcm:slack-vvs--ch-C0BV9SBB6R2',
+        lastActivityAt: twoHoursAgo,
+      });
+
+      store.save('test-platform:idle-thread', threadSession);
+      store.save('test-platform:dcm:slack-vvs--ch-C0BV9SBB6R2', channelSession);
+
+      const staleIds = store.cleanStale(60 * 60 * 1000); // 1 hour
+
+      expect(staleIds).toEqual(['test-platform:idle-thread']);
+
+      // The channel session is still live, not merely still on disk: `load()`
+      // is what the resume path reads, and it is the lookup the bug hid it from.
+      const live = store.load();
+      expect(live.has('test-platform:dcm:slack-vvs--ch-C0BV9SBB6R2')).toBe(true);
+      expect(live.has('test-platform:idle-thread')).toBe(false);
+    });
+
     it('skips already soft-deleted sessions', () => {
       const session = createTestSession({
         threadId: 'old-thread',
@@ -287,7 +342,7 @@ describe('SessionStore', () => {
       });
 
       store.save('test-platform:old-thread', session);
-      store.softDelete('test-platform:old-thread');
+      store.softDelete('test-platform:old-thread', 'stopped');
 
       // Should not soft-delete again
       const staleIds = store.cleanStale(60 * 60 * 1000);
@@ -303,7 +358,7 @@ describe('SessionStore', () => {
       store.save('test-platform:thread-1', session1);
       store.save('test-platform:thread-2', session2);
 
-      store.softDelete('test-platform:thread-1');
+      store.softDelete('test-platform:thread-1', 'stopped');
 
       const history = store.getHistory('test-platform');
       expect(history.length).toBe(1);
@@ -317,10 +372,10 @@ describe('SessionStore', () => {
       store.save('test-platform:thread-1', session1);
       store.save('test-platform:thread-2', session2);
 
-      store.softDelete('test-platform:thread-1');
+      store.softDelete('test-platform:thread-1', 'stopped');
       // Small delay to ensure different cleanedAt timestamps
       await new Promise(resolve => setTimeout(resolve, 10));
-      store.softDelete('test-platform:thread-2');
+      store.softDelete('test-platform:thread-2', 'stopped');
 
       const history = store.getHistory('test-platform');
       expect(history.length).toBe(2);
@@ -335,8 +390,8 @@ describe('SessionStore', () => {
       store.save('platform-a:thread-1', session1);
       store.save('platform-b:thread-2', session2);
 
-      store.softDelete('platform-a:thread-1');
-      store.softDelete('platform-b:thread-2');
+      store.softDelete('platform-a:thread-1', 'stopped');
+      store.softDelete('platform-b:thread-2', 'stopped');
 
       const historyA = store.getHistory('platform-a');
       expect(historyA.length).toBe(1);
@@ -398,7 +453,7 @@ describe('SessionStore', () => {
         lastActivityAt: new Date(Date.now() - 5000).toISOString(), // 5 seconds ago
       });
       store.save('test-platform:completed-thread', completedSession);
-      store.softDelete('test-platform:completed-thread');
+      store.softDelete('test-platform:completed-thread', 'stopped');
 
       // Small delay
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -493,6 +548,46 @@ describe('SessionStore', () => {
       if (existsSync(tempFile)) {
         unlinkSync(tempFile);
       }
+    });
+
+    it('a degraded read refuses the next write instead of wiping all sessions', () => {
+      // Persist a session, then corrupt the file. Reads degrade to empty —
+      // but a save() proceeding on that emptiness used to atomically
+      // replace the file, destroying every persisted session across all
+      // platforms. The write must refuse (without throwing: persist paths
+      // are fire-and-forget) and leave the corrupt file for recovery.
+      tempStore = new SessionStore(tempFile);
+      const session = createTestSession();
+      tempStore.save(`${session.platformId}:${session.threadId}`, session);
+
+      writeFileSync(tempFile, '{not json');
+      const another = createTestSession({ threadId: 'thread-other' });
+      tempStore.save(`${another.platformId}:${another.threadId}`, another); // must not throw
+      expect(readFileSync(tempFile, 'utf-8')).toBe('{not json');
+
+      // Once the file is readable again, writes resume.
+      writeFileSync(tempFile, JSON.stringify({ version: 1, sessions: {} }));
+      tempStore.save(`${another.platformId}:${another.threadId}`, another);
+      expect(tempStore.load().size).toBe(1);
+    });
+
+    it('an empty file is a writable empty store, not a degraded read', () => {
+      // A zero-length sessions.json (crashed first write, `touch`ed by an
+      // operator) has provably nothing to lose. It must NOT trip the
+      // degraded-read refusal above, or the store is read-only forever.
+      writeFileSync(tempFile, '');
+      tempStore = new SessionStore(tempFile);
+      expect(tempStore.load().size).toBe(0);
+
+      const session = createTestSession();
+      tempStore.save(`${session.platformId}:${session.threadId}`, session);
+      expect(tempStore.load().size).toBe(1);
+
+      // Whitespace-only behaves the same.
+      writeFileSync(tempFile, '  \n\t\n');
+      expect(tempStore.load().size).toBe(0);
+      tempStore.save(`${session.platformId}:${session.threadId}`, session);
+      expect(tempStore.load().size).toBe(1);
     });
 
     it('load() handles {} file content gracefully', () => {

@@ -90,6 +90,26 @@ describe('RoutinesStore CRUD', () => {
     expect(store.get('mm', result.routine.id)?.name).toBe('Standup summary');
   });
 
+  test('add() returns a copy — caller mutations never reach the store', async () => {
+    const result = await store.add('mm', newRoutine());
+    if (!result.ok) throw new Error(result.error);
+
+    result.routine.name = 'mutated-by-caller';
+
+    expect(store.get('mm', result.routine.id)?.name).toBe('Standup summary');
+  });
+
+  test('defaults requireApproval to true (safe) and preserves an explicit false', async () => {
+    const dflt = await store.add('mm', newRoutine({ name: 'default-posture' }));
+    if (!dflt.ok) throw new Error('add failed');
+    expect(dflt.routine.requireApproval).toBe(true);
+
+    const autonomous = await store.add('mm', { ...newRoutine({ name: 'autonomous' }), requireApproval: false });
+    if (!autonomous.ok) throw new Error('add failed');
+    expect(autonomous.routine.requireApproval).toBe(false);
+    expect(store.get('mm', autonomous.routine.id)?.requireApproval).toBe(false);
+  });
+
   test('writes 0600', async () => {
     await store.add('mm', newRoutine());
     expect(statSync(file).mode & 0o777).toBe(0o600);

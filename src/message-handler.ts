@@ -5,6 +5,7 @@
  * This ensures tests exercise the actual bot logic, not a duplicate.
  */
 
+import { sessionAllowedUserSet } from './session/authorization.js';
 import type { PlatformClient, PlatformPost, PlatformUser } from './platform/index.js';
 import type { SessionManager } from './session/index.js';
 import {
@@ -21,8 +22,53 @@ import { logSilentError } from './utils/error-handler/index.js';
 import { dcmThreadId, isDcmThreadId, resolveAckReaction, resolveApprovals, resolveDirectChannelMode, type DirectChannelModeConfig } from './platform/utils.js';
 import { auditLog } from './persistence/audit-log.js';
 import { createLogger } from './utils/logger.js';
+import { shouldPostResumeRefusal } from './session/refusal-limiter.js';
 
 const ackLog = createLogger('ack');
+
+/**
+ * Commands the paused-session branch may answer without a live session.
+ *
+ * Deliberately an explicit list rather than `worksInFirstMessage`: that flag
+ * means "may appear before a session exists", which is a different question.
+ * `!worktree remove` / `cleanup` / `off` carry it and still call
+ * active-session-only methods — dispatched in a paused thread they find
+ * nothing, do nothing, and report success.
+ *
+ * Every entry here has to produce its answer from something other than a
+ * session: the command registry, the changelog, the account pool.
+ */
+const PAUSED_SAFE_COMMANDS: ReadonlySet<string> = new Set(['help', 'release-notes', 'usage']);
+
+/**
+ * Machine-generated status posts from claude-threads itself (any instance,
+ * any version). When several bots share a server, one bot's status output
+ * must never read as a request to another — a refusal that @-mentioned a
+ * fellow bot once produced an unbounded two-bot loop (#491). Matching is
+ * anchored to the exact emoji + phrase shapes the bot emits (with either
+ * platform's bold markers), so a human message that merely *starts* with one
+ * of these emoji still gets through.
+ */
+const BOLD = String.raw`(?:\*{1,2}|_{1,2})?`;
+const STATUS_POST_PATTERNS: RegExp[] = [
+  // Authorization refusals — the addressee may render as @name, `name`, or a
+  // raw <@U…> token depending on platform and version.
+  /^⚠️\s+\S+ is not authorized\b/u,
+  new RegExp(`^⚠️\\s+${BOLD}Too busy${BOLD} -`, 'u'),
+  new RegExp(`^⏱️\\s+${BOLD}Session (?:timed out|idle)${BOLD}`, 'u'),
+  new RegExp(`^🛑\\s+${BOLD}Session cancelled${BOLD}`, 'u'),
+  new RegExp(`^🔴\\s+${BOLD}EMERGENCY SHUTDOWN${BOLD}`, 'u'),
+  new RegExp(`^🔄\\s+${BOLD}Session resumed${BOLD}`, 'u'),
+];
+
+/**
+ * Whether a message is one of claude-threads' own status posts (#491).
+ * Exported for tests.
+ */
+export function isClaudeThreadsStatusPost(message: string): boolean {
+  const trimmed = message.trim();
+  return STATUS_POST_PATTERNS.some((re) => re.test(trimmed));
+}
 
 /**
  * Logger interface for message handler
@@ -77,6 +123,36 @@ function ackReceipt(client: PlatformClient, postId: string): void {
   });
 }
 
+/**
+ * The user a message opens by addressing, when that user is NOT the bot —
+ * i.e. a human-to-human side conversation the bot must stay out of.
+ * Understands both mention syntaxes: plain '@name' (Mattermost, and typed
+ * names on Slack) and Slack's raw '<@U0…>' / '<@U0…|label>' forms — the raw
+ * form is what Slack actually delivers, so matching only '@name' silently
+ * disabled this guard on Slack. Returns the mentioned identifier, or null
+ * when the message doesn't open with a mention, opens by addressing the
+ * bot, or mentions the bot ANYWHERE — '@bob can you review? @bot summarize'
+ * explicitly asks the bot and must reach it (parity with the DCM
+ * new-session guard's isBotMentioned exemption).
+ */
+function leadingOtherUserMention(client: PlatformClient, message: string): string | null {
+  if (client.isBotMentioned(message)) return null;
+  const trimmed = message.trim();
+  const named = trimmed.match(/^@([\w.-]+)/);
+  if (named) {
+    return named[1].toLowerCase() === client.getBotName().toLowerCase() ? null : named[1];
+  }
+  // The raw token form exists only on Slack. Mattermost never produces it,
+  // so a literal '<@…>' there (pasted Slack output) is ordinary text, not
+  // an address — matching it would silently drop real follow-ups.
+  if (client.platformType !== 'slack') return null;
+  const raw = trimmed.match(/^<@([A-Z0-9]+)(?:\|[^>]*)?>/i);
+  if (raw) {
+    return raw[1];
+  }
+  return null;
+}
+
 export async function handleMessage(
   client: PlatformClient,
   session: SessionManager,
@@ -95,6 +171,14 @@ export async function handleMessage(
   const formatter = client.getFormatter();
 
   try {
+    // Another claude-threads instance's status output is machine output,
+    // never a request — dropping it here breaks bot-to-bot loops (#491)
+    // regardless of which refusal or notice shape triggered them.
+    if (isClaudeThreadsStatusPost(message)) {
+      logger?.debug?.(`Ignoring claude-threads status post from @${username}`);
+      return;
+    }
+
     // Check for !kill command (emergency shutdown)
     const lowerMessage = message.trim().toLowerCase();
     if (
@@ -141,16 +225,16 @@ export async function handleMessage(
 
     // Follow-up in active thread
     // Use registry to check for active session directly
-    const activeSession = session.registry.findByThreadId(threadRoot);
+    const activeSession = session.registry.findByThreadId(threadRoot, platformId);
     if (activeSession) {
-      // If message starts with @mention to someone else, track it as side conversation (if from approved user)
-      const mentionMatch = message.trim().match(/^@([\w.-]+)/);
-      if (mentionMatch && mentionMatch[1].toLowerCase() !== client.getBotName().toLowerCase()) {
-        // Track side conversation if from approved user
-        if (session.isUserAllowedInSession(threadRoot, username)) {
+      // A message opening by addressing someone else is a side conversation:
+      // track it (if from an approved user) and don't interrupt Claude.
+      const sideMentionActive = leadingOtherUserMention(client, message);
+      if (sideMentionActive) {
+        if (session.isUserAllowedInSession(threadRoot, username, platformId)) {
           session.addSideConversation(threadRoot, {
             fromUser: username,
-            mentionedUser: mentionMatch[1],
+            mentionedUser: sideMentionActive,
             message: message,
             timestamp: new Date(),
             postId: post.id,
@@ -166,7 +250,7 @@ export async function handleMessage(
       // Parse command using shared parser
       const parsed = parseCommand(content);
       if (parsed) {
-        const isAllowed = session.isUserAllowedInSession(threadRoot, username);
+        const isAllowed = session.isUserAllowedInSession(threadRoot, username, platformId);
 
         // Build executor context
         const ctx: CommandExecutorContext = {
@@ -213,7 +297,7 @@ export async function handleMessage(
       // consumed even in quiet mode. Mirrors how commands bypass the gate.
       if (session.hasPendingWorktreePrompt(threadRoot)) {
         // Only session owner can respond
-        if (session.isUserAllowedInSession(threadRoot, username)) {
+        if (session.isUserAllowedInSession(threadRoot, username, platformId)) {
           const handled = await session.handleWorktreeBranchResponse(
             threadRoot,
             content,
@@ -234,7 +318,7 @@ export async function handleMessage(
       }
 
       // Check if user is allowed in this session
-      if (!session.isUserAllowedInSession(threadRoot, username)) {
+      if (!session.isUserAllowedInSession(threadRoot, username, platformId)) {
         // Request approval for their message
         if (content) await session.requestMessageApproval(threadRoot, username, content);
         return;
@@ -252,11 +336,10 @@ export async function handleMessage(
 
     // Check for paused session that can be resumed
     // Use registry to check for persisted session directly
-    const hasPausedSession = session.registry.getPersistedByThreadId(threadRoot) !== undefined;
+    const hasPausedSession = session.registry.getPersistedByThreadId(threadRoot, platformId) !== undefined;
     if (hasPausedSession) {
-      // If message starts with @mention to someone else, ignore it (side conversation)
-      const mentionMatch = message.trim().match(/^@([\w.-]+)/);
-      if (mentionMatch && mentionMatch[1].toLowerCase() !== client.getBotName().toLowerCase()) {
+      // A message opening by addressing someone else is a side conversation.
+      if (leadingOtherUserMention(client, message)) {
         return; // Side conversation, don't interrupt
       }
 
@@ -269,9 +352,9 @@ export async function handleMessage(
       if (pausedParsed) {
         if (pausedParsed.command === 'stop') {
           // Clean up the paused session instead of resuming it
-          const persistedSession = session.getPersistedSession(threadRoot);
+          const persistedSession = session.getPersistedSession(threadRoot, platformId);
           if (persistedSession) {
-            const allowedUsers = new Set(persistedSession.sessionAllowedUsers);
+            const allowedUsers = sessionAllowedUserSet(persistedSession);
             if (allowedUsers.has(username) || client.isUserAllowed(username)) {
               auditLog(platformId, {
                 threadId: threadRoot,
@@ -280,15 +363,75 @@ export async function handleMessage(
                 tool: 'stop',
                 detail: 'paused session cancelled',
               });
-              session.cancelPausedSession(threadRoot);
+              session.cancelPausedSession(threadRoot, platformId);
               await client.createPost(
                 `🛑 ${formatter.formatBold('Session cancelled')} by ${formatter.formatUserMention(username)}`,
                 threadRoot
               );
             }
           }
+          return;
         }
-        // All commands in paused state are consumed (not passed as prompts)
+
+        // Every other command is consumed here. In silence, it was the wrong
+        // default for the commands that need no session at all: `!help` above
+        // all, which is exactly what someone reaches for when a thread has
+        // stopped answering — and which answered with nothing, making a stuck
+        // thread look like a dead bot.
+        //
+        // ⚠️ Gated on the platform allowlist FIRST, mirroring the new-session
+        // path, which checks `isUserAllowed` before it reaches the executor.
+        // Without this, the paused branch would be the one place a
+        // non-allowlisted user could run first-message commands — and
+        // `worksInFirstMessage` is not a synonym for harmless: it covers
+        // `!worktree list` and `!worktree switch`, which post repository
+        // branches and absolute paths. Several handlers never consult
+        // `ctx.isAllowed` themselves, so passing it is not a substitute for
+        // refusing here.
+        if (!client.isUserAllowed(username)) {
+          logger?.debug?.(
+            `!${pausedParsed.command} from unauthorized @${username} in paused thread ${threadRoot} — dropped`
+          );
+          return;
+        }
+
+        // ⚠️ An explicit allowlist, NOT `worksInFirstMessage`. The two are not
+        // the same question: `worksInFirstMessage` means "can appear before a
+        // session exists", and `!worktree remove` / `cleanup` / `off` qualify
+        // while still calling active-session-only methods. Dispatched here they
+        // would find no session, do nothing, and return `handled: true` — a
+        // silent no-op that also skips the diagnostic log below, which is the
+        // exact failure this branch is being fixed for.
+        //
+        // These three answer from nothing: help renders the registry,
+        // release-notes reads the changelog, usage probes the account pool.
+        if (!PAUSED_SAFE_COMMANDS.has(pausedParsed.command)) {
+          logger?.debug?.(
+            `!${pausedParsed.command} from @${username} needs an active session; thread ${threadRoot} is paused — dropped`
+          );
+          return;
+        }
+
+        const immediateCtx: CommandExecutorContext = {
+          commandContext: 'first-message',
+          threadId: threadRoot,
+          username,
+          client,
+          sessionManager: session,
+          formatter,
+          isAllowed: true, // refused above; every handler here has cleared the allowlist
+          files: post.metadata?.files,
+        };
+        const immediate = await executeCommand(pausedParsed.command, pausedParsed.args, immediateCtx);
+        if (immediate.handled) return;
+
+        // Consumed, but never silently: a command that vanishes with no reply
+        // and no log is indistinguishable from a bot that has stopped
+        // receiving events, and sends whoever is debugging it down the wrong
+        // path entirely.
+        logger?.debug?.(
+          `!${pausedParsed.command} from @${username} needs an active session; thread ${threadRoot} is paused — dropped`
+        );
         return;
       }
 
@@ -296,17 +439,24 @@ export async function handleMessage(
       // approvals mode `owner`, message-based resume is scoped to session
       // participants, matching the reaction-based resume gate in
       // reaction-router.ts — the platform allowlist alone is not enough.
-      const persistedSession = session.getPersistedSession(threadRoot);
+      const persistedSession = session.getPersistedSession(threadRoot, platformId);
       if (persistedSession) {
-        const allowedUsers = new Set(persistedSession.sessionAllowedUsers);
+        const allowedUsers = sessionAllowedUserSet(persistedSession);
         const ownerScoped =
           resolveApprovals(client.approvals, isDcmThreadId(threadRoot)) === 'owner';
         if (!allowedUsers.has(username) && (ownerScoped || !client.isUserAllowed(username))) {
-          // Not allowed - could request approval but that would require the session to be active
-          await client.createPost(
-            `⚠️ ${formatter.formatUserMention(username)} is not authorized to resume this session`,
-            threadRoot
-          );
+          // Not allowed - could request approval but that would require the
+          // session to be active. The refusal deliberately does NOT @-mention
+          // the refused user (inline code reads the same to a human and
+          // notifies nobody) and is rate-limited per (thread, user): a message
+          // whose purpose is "stop talking to me" must not be the one shape
+          // guaranteed to wake another bot into replying (#491).
+          if (shouldPostResumeRefusal(platformId, threadRoot, username)) {
+            await client.createPost(
+              `⚠️ ${formatter.formatCode(username)} is not authorized to resume this session`,
+              threadRoot
+            );
+          }
           return;
         }
       }
@@ -326,7 +476,7 @@ export async function handleMessage(
 
       if (content || files?.length) {
         ackReceipt(client, post.id);
-        await session.resumePausedSession(threadRoot, content, files, username);
+        await session.resumePausedSession(threadRoot, content, files, username, platformId);
       }
       return;
     }
@@ -336,10 +486,43 @@ export async function handleMessage(
     // addressed to the bot (the channel is the session). With
     // `respondTo: mention` the DCM session also starts only on a mention.
     const mentionRequired = !dcm.enabled || dcm.respondTo === 'mention';
-    if (mentionRequired && !client.isBotMentioned(message)) return;
+    if (mentionRequired && !client.isBotMentioned(message)) {
+      // The bot is about to ignore this message — the one moment event
+      // triggers (watches) evaluate it. Fire-and-forget: evaluation must
+      // never delay or break message handling. Session and paused-session
+      // threads returned above, so a fired session's own thread can never
+      // re-trigger a watch. Watches are inert in DCM: every message in a DCM
+      // channel routes to the synthetic channel-session key (line ~94), so a
+      // session fired on the message's REAL thread root would be unreachable
+      // — replies and !stop in its thread would never route to it.
+      if (!dcm.enabled) {
+        session.evaluateWatches(platformId, post, username, message);
+      }
+      return;
+    }
+
+    // DCM: a channel message opening with @someone-else is a human-to-human
+    // side conversation. The active- and paused-session paths ignore those
+    // (and docs promise it) — the new-session path must too, or the bot
+    // injects itself into the exchange the moment no session is running.
+    if (dcm.enabled && leadingOtherUserMention(client, message)) {
+      return;
+    }
 
     if (!client.isUserAllowed(username)) {
-      await client.createPost(`⚠️ ${formatter.formatUserMention(username)} is not authorized`, threadRoot);
+      // Warn only when the user explicitly addressed the bot. In DCM
+      // all-messages mode EVERY channel message from a non-allowlisted
+      // member reaches this branch — an unconditional warning would be
+      // unbounded channel spam, and on Mattermost (which deliberately lets
+      // other bots' posts through) two bots could warn at each other in an
+      // endless loop.
+      if (client.isBotMentioned(message)) {
+        // No @-mention and rate-limited, for the same loop-safety reasons as
+        // the resume refusal above (#491).
+        if (shouldPostResumeRefusal(platformId, threadRoot, username)) {
+          await client.createPost(`⚠️ ${formatter.formatCode(username)} is not authorized`, threadRoot);
+        }
+      }
       return;
     }
 
@@ -371,6 +554,28 @@ export async function handleMessage(
       isAllowed: true, // Already verified authorization above
       files,
     };
+
+    // A session-only command typed on its own starts nothing.
+    //
+    // `parseCommandWithRemainder` below only recognises the first-message
+    // commands, so anything else — `!stop`, `!escape`, `!approve` — falls
+    // straight through and becomes the opening PROMPT of a brand-new session.
+    // `!stop` is the one that bites: once a stopped thread routes here (which
+    // is the point of the `EndReason` split), typing `!stop` again would
+    // answer a request to stop by starting.
+    //
+    // Scoped to the command being the whole message. "!stop the deploy" is
+    // someone talking, and still reaches Claude as a prompt.
+    const firstMessageCommand = parseCommand(prompt);
+    if (firstMessageCommand && !firstMessageCommand.args?.trim()) {
+      const def = COMMAND_REGISTRY.find(c => c.command === firstMessageCommand.command);
+      if (def && !def.worksInFirstMessage) {
+        logger?.debug?.(
+          `!${firstMessageCommand.command} needs an active session; ${threadRoot} has none — dropped`
+        );
+        return;
+      }
+    }
 
     // Process commands that can appear at the start of the first message
     let continueProcessing = true;

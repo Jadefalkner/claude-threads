@@ -335,8 +335,18 @@ export async function detectWorktreeInfo(
     // Get the branch name from git
     const branchOutput = await execGit(['rev-parse', '--abbrev-ref', 'HEAD'], workingDir);
     const branch = branchOutput?.trim();
-    if (!branch) {
+    // A detached HEAD reports the literal string "HEAD" — not a branch name;
+    // downstream (findWorktreeByBranch, list markers) would treat it as one.
+    if (!branch || branch === 'HEAD') {
       log.debug(`Could not detect branch for worktree at ${workingDir}`);
+      return null;
+    }
+
+    // The worktree root, not workingDir: a session may start in a nested
+    // subdirectory, and reference counting / `git worktree remove` must see
+    // the actual worktree path.
+    const toplevel = (await execGit(['rev-parse', '--show-toplevel'], workingDir))?.trim();
+    if (!toplevel || !isValidWorktreePath(toplevel)) {
       return null;
     }
 
@@ -347,9 +357,9 @@ export async function detectWorktreeInfo(
     log.debug(`Detected worktree: path=${workingDir}, branch=${branch}, repoRoot=${repoRoot}`);
 
     return {
-      worktreePath: workingDir,
+      worktreePath: toplevel,
       branch,
-      repoRoot: repoRoot || workingDir,
+      repoRoot: repoRoot || toplevel,
     };
   } catch (err) {
     log.debug(`Failed to detect worktree info for ${workingDir}: ${err}`);
@@ -377,13 +387,16 @@ export async function createWorktree(
   const exists = await branchExists(repoRoot, branch);
 
   if (exists) {
-    // Use existing branch
+    // Use existing branch. The `--` separator stops git from parsing a
+    // leading-dash branch/path as an option (defense-in-depth alongside
+    // isValidBranchName).
     log.debug(`Branch '${branch}' exists, adding worktree`);
-    await execGit(['worktree', 'add', targetDir, branch], repoRoot);
+    await execGit(['worktree', 'add', '--', targetDir, branch], repoRoot);
   } else {
-    // Create new branch from HEAD
+    // Create new branch from HEAD. `-b <branch>` must precede `--`; the
+    // separator then guards the positional path argument.
     log.debug(`Branch '${branch}' does not exist, creating with worktree`);
-    await execGit(['worktree', 'add', '-b', branch, targetDir], repoRoot);
+    await execGit(['worktree', 'add', '-b', branch, '--', targetDir], repoRoot);
   }
 
   log.info(`Worktree created successfully: ${targetDir}`);
@@ -436,10 +449,18 @@ export function isValidBranchName(name: string): boolean {
   // Cannot contain ..
   if (name.includes('..')) return false;
 
-  // Cannot contain special characters
+  // Cannot contain characters git forbids in ref names
   if (/[\s~^:?*[\]\\]/.test(name)) return false;
 
-  // Cannot start with -
+  // SECURITY: reject shell metacharacters. Git itself permits these in ref
+  // names, but on Windows the spawn wrapper runs git with `shell:true`, where
+  // Node does not escape argv — an unescaped `&`, `|`, backtick, `$()`, etc.
+  // in a branch name becomes a cmd.exe command-injection vector. Blocking them
+  // here (rather than only quoting at the spawn site) is defense-in-depth and
+  // costs only exotic-but-legal branch names that nobody uses in practice.
+  if (/[&|;$`(){}<>!'"#%]/.test(name)) return false;
+
+  // Cannot start with - (would be parsed as a git flag)
   if (name.startsWith('-')) return false;
 
   // Cannot end with .lock

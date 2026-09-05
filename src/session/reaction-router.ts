@@ -24,6 +24,7 @@ import { isDcmThreadId, resolveApprovals } from '../platform/utils.js';
 import type { Session } from './types.js';
 import type { ReactionAction } from '../operations/executors/types.js';
 import type { SessionRegistry } from './registry.js';
+import { isRevivable } from '../persistence/session-store.js';
 import type { SessionStore } from '../persistence/session-store.js';
 import type { ResolvedLimits } from '../config/index.js';
 import type { SessionContext } from '../operations/session-context/index.js';
@@ -36,7 +37,8 @@ import {
   isBugReportEmoji,
 } from '../utils/emoji.js';
 import { normalizeEmojiName } from '../platform/utils.js';
-import { isAuthorizedForSession } from './authorization.js';
+import { isAuthorizedForSession, sessionAllowedUserSet } from './authorization.js';
+import { shouldPostResumeRefusal } from './refusal-limiter.js';
 import * as lifecycle from './lifecycle.js';
 import * as commands from '../operations/commands/index.js';
 import * as worktreeModule from '../operations/worktree/index.js';
@@ -144,6 +146,20 @@ async function tryResumeFromReaction(
   const persistedSession = deps.sessionStore.findByPostId(platformId, postId);
   if (!persistedSession) return false;
 
+  // A stopped session stays stopped, whichever door you knock on. This lookup
+  // is by post id, so it never passes the paused-session gate that filters
+  // these out for messages — and a stopped record keeps its
+  // `sessionStartPostId` and `lifecyclePostId`, so its old posts still carry a
+  // live-looking 🔄. Without this check, `!stop` could be undone by reacting to
+  // a message from before it, resurrecting a conversation `killSession` has
+  // already distilled into channel memory as ended.
+  if (!isRevivable(persistedSession)) {
+    log.debug(
+      `Ignoring resume reaction on stopped session ${persistedSession.threadId.substring(0, 8)}...`
+    );
+    return false;
+  }
+
   // Already active? Nothing to resume.
   const sessionId = `${platformId}:${persistedSession.threadId}`;
   if (deps.registry.hasById(sessionId)) return false;
@@ -153,9 +169,7 @@ async function tryResumeFromReaction(
   // through the same isAuthorizedForSession helper as the lifecycle sinks
   // (#388) so there is one authorization decision, not two copies.
   const platform = deps.platforms.get(platformId);
-  const sessionAllowedUsers = new Set(
-    persistedSession.sessionAllowedUsers || [persistedSession.startedBy].filter(Boolean),
-  );
+  const sessionAllowedUsers = sessionAllowedUserSet(persistedSession);
   // Effective approvals mode `owner`: resume is participant-only, the
   // platform-wide allowlist must not bypass the scoping (consistent with the
   // active-session reaction gate above).
@@ -168,9 +182,13 @@ async function tryResumeFromReaction(
       ? sessionAllowedUsers.has(username)
       : isAuthorizedForSession({ username, platform, sessionAllowedUsers }));
   if (!platform || !resumeAuthorized) {
-    if (platform) {
+    // No @-mention (inline code reads the same and notifies nobody) and
+    // rate-limited per (thread, user) — a refusal that mentioned another
+    // claude-threads bot once produced an unbounded reply loop (#491).
+    if (platform && shouldPostResumeRefusal(platformId, persistedSession.threadId, username)) {
+      const fmt = platform.getFormatter();
       await platform.createPost(
-        `⚠️ @${username} is not authorized to resume this session`,
+        `⚠️ ${fmt.formatCode(username)} is not authorized to resume this session`,
         persistedSession.threadId,
       );
     }

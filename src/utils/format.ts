@@ -100,6 +100,14 @@ export function formatRelativeTimeShort(date: Date): string {
 // =============================================================================
 
 /**
+ * Compact UTC minute stamp for list displays: `2026-08-24T01:57:45.123Z`
+ * becomes `2026-08-24 01:57Z`.
+ */
+export function formatIsoMinute(iso: string): string {
+  return `${iso.slice(0, 16).replace('T', ' ')}Z`;
+}
+
+/**
  * Format version string for status bar display.
  * CT = claude-threads, CC = Claude Code (the CLI).
  *
@@ -153,4 +161,14 @@ export function truncateAtWord(str: string, maxLength: number): string {
 
   // Fall back to hard truncation
   return truncated + '…';
+}
+
+/**
+ * Collapse model-controlled text to one line for human-approval cards: every
+ * whitespace run (newlines included) becomes a single space, so embedded
+ * markdown can never restyle a card or bury its badge. U+0085 (NEL) is named
+ * explicitly — JS `\s` excludes it, yet some renderers break lines on it.
+ */
+export function singleLine(text: string): string {
+  return text.replace(/[\s\u0085]+/g, ' ').trim();
 }

@@ -37,16 +37,14 @@
 
 import { createHash } from 'crypto';
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   realpathSync,
-  writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
 import { basename, dirname, join, sep } from 'path';
+import { SerialQueue, writeFileAtomic } from '../persistence/atomic-file.js';
 import { createLogger } from '../utils/logger.js';
 import { getMainRepositoryRoot } from '../git/worktree.js';
 import type { ResolvedMemoryConfig } from '../config/types.js';
@@ -71,22 +69,28 @@ export const MAX_ENTRY_LENGTH = 500;
 const FILE_HEADER = '# Channel memory — managed by claude-threads.';
 
 /**
- * Entry line format: `- [YYYY-MM-DD] (@user) text` or `- [YYYY-MM-DD] (distilled) text`.
+ * Entry line format: `- [YYYY-MM-DD] (@user) text`, `(distilled)`, or
+ * `(agent)` — the last written by Claude itself via the `remember_fact` MCP
+ * tool. Compat note: a pre-agent-source bot parses `(agent)` lines as raw
+ * lines — preserved across rewrites, shown by `!memory`, but not
+ * forgettable-by-number until upgraded.
  */
-const ENTRY_RE = /^- \[(\d{4}-\d{2}-\d{2})\] \((@[^\s)]+|distilled)\) (.+)$/;
+const ENTRY_RE = /^- \[(\d{4}-\d{2}-\d{2})\] \((@[^\s)]+|distilled|agent)\) (.+)$/;
+
+export type ChannelMemorySource = 'user' | 'distilled' | 'agent';
 
 export interface ChannelMemoryEntry {
   text: string;
   /** YYYY-MM-DD */
   addedAt: string;
-  source: 'user' | 'distilled';
+  source: ChannelMemorySource;
   /** Username, only for `source: 'user'`. */
   addedBy?: string;
 }
 
 export interface NewChannelMemoryEntry {
   text: string;
-  source: 'user' | 'distilled';
+  source: ChannelMemorySource;
   addedBy?: string;
 }
 
@@ -190,7 +194,7 @@ function normalizeForDedupe(text: string): string {
 
 /** Collapse to a single line (newlines become `; `, whitespace runs collapse). */
 function collapseEntryText(text: string): string {
-  return text.replace(/\s*[\r\n]+\s*/g, '; ').replace(/\s+/g, ' ').trim();
+  return text.replace(/\s*[\r\n\u0085]+\s*/g, '; ').replace(/[\s\u0085]+/g, ' ').trim();
 }
 
 /** Collapse to a single line and cap the length. */
@@ -207,9 +211,14 @@ export function entryTextExceedsCap(text: string): boolean {
   return collapseEntryText(text).length > MAX_ENTRY_LENGTH;
 }
 
+/** Canonical provenance label: '@name' for user entries, the source name
+ *  otherwise. Shared by the file format, `!memory`, and `list_memory`. */
+export function entrySourceLabel(entry: ChannelMemoryEntry): string {
+  return entry.source === 'user' ? `@${entry.addedBy ?? 'unknown'}` : entry.source;
+}
+
 function formatEntryLine(entry: ChannelMemoryEntry): string {
-  const source = entry.source === 'user' ? `@${entry.addedBy ?? 'unknown'}` : 'distilled';
-  return `- [${entry.addedAt}] (${source}) ${entry.text}`;
+  return `- [${entry.addedAt}] (${entrySourceLabel(entry)}) ${entry.text}`;
 }
 
 function todayStamp(): string {
@@ -225,7 +234,7 @@ export class MemoryStore {
    * bot is a single process and the CLI never touches `channel/`, so an
    * in-process lock is sufficient.
    */
-  private readonly locks: Map<string, Promise<unknown>> = new Map();
+  private readonly locks: Map<string, SerialQueue> = new Map();
 
   constructor(rootDir?: string) {
     this.root = rootDir ?? process.env.CLAUDE_THREADS_MEMORY_DIR ?? DEFAULT_ROOT;
@@ -281,11 +290,12 @@ export class MemoryStore {
         const isDuplicate = existing.some((e) => {
           const en = normalizeForDedupe(e.text);
           if (en === normalized) return true;
-          // Containment counts as a duplicate only for distilled candidates.
-          // An explicit user `!remember` that is a fragment of an existing
-          // entry may be a correction or contradiction ("use npm" vs a stored
-          // "never use npm") — it must land, not be swallowed as known.
-          return candidate.source === 'distilled' && en.includes(normalized);
+          // Containment counts as a duplicate only for non-user candidates
+          // (distilled, agent). An explicit user `!remember` that is a
+          // fragment of an existing entry may be a correction or
+          // contradiction ("use npm" vs a stored "never use npm") — it must
+          // land, not be swallowed as known.
+          return candidate.source !== 'user' && en.includes(normalized);
         });
         if (isDuplicate) {
           result.duplicates.push(text);
@@ -299,12 +309,14 @@ export class MemoryStore {
         // session-authorized user — including temporarily invited ones —
         // so an unrestricted supersede would let a non-owner silently
         // delete/rewrite another principal's entry by embedding its text.
-        // Rule: distilled entries are fair game for anyone (background
-        // inference, no author); a user entry may only be superseded by the
-        // SAME user. Anything else coexists — visible in `!memory`, and the
-        // owner can resolve the contradiction with `forget`.
+        // Rule: non-user entries (distilled, agent) are fair game for anyone
+        // (background inference / model output, no human author); a user
+        // entry may only be superseded by the SAME user — in particular an
+        // agent candidate can never displace a user's entry. Anything else
+        // coexists — visible in `!memory`, and the owner can resolve the
+        // contradiction with `forget`.
         const canSupersede = (e: ChannelMemoryEntry): boolean =>
-          e.source === 'distilled' ||
+          e.source !== 'user' ||
           (candidate.source === 'user' && e.source === 'user' && e.addedBy === candidate.addedBy);
         for (let i = lines.length - 1; i >= 0; i--) {
           const e = lines[i].entry;
@@ -414,8 +426,10 @@ export class MemoryStore {
     };
     while (lines.length > 1 && overCap(lines)) {
       truncated = true;
-      const distilledIdx = lines.findIndex((l) => l.entry?.source === 'distilled');
-      lines.splice(distilledIdx >= 0 ? distilledIdx : 0, 1);
+      // Oldest model-written (distilled/agent) entries go first; user
+      // entries and hand edits survive longest.
+      const modelIdx = lines.findIndex((l) => l.entry !== undefined && l.entry.source !== 'user');
+      lines.splice(modelIdx >= 0 ? modelIdx : 0, 1);
     }
 
     const rendered = lines.map((l) => l.raw).join('\n');
@@ -430,11 +444,12 @@ export class MemoryStore {
 
   /** Serialize a mutating operation per platform id. */
   private runExclusive<T>(platformId: string, fn: () => T): Promise<T> {
-    const tail = this.locks.get(platformId) ?? Promise.resolve();
-    const next = tail.then(fn, fn);
-    // Park the tail (swallowing rejections so one failure doesn't poison the chain).
-    this.locks.set(platformId, next.catch(() => undefined));
-    return next;
+    let queue = this.locks.get(platformId);
+    if (!queue) {
+      queue = new SerialQueue();
+      this.locks.set(platformId, queue);
+    }
+    return queue.run(fn);
   }
 
   /**
@@ -454,7 +469,8 @@ export class MemoryStore {
       if (!trimmed || trimmed === FILE_HEADER) continue;
       const m = trimmed.match(ENTRY_RE);
       if (m) {
-        const source = m[2] === 'distilled' ? 'distilled' : 'user';
+        const source: ChannelMemorySource =
+          m[2] === 'distilled' ? 'distilled' : m[2] === 'agent' ? 'agent' : 'user';
         lines.push({
           raw: trimmed,
           entry: {
@@ -471,11 +487,12 @@ export class MemoryStore {
     return lines;
   }
 
-  /** Enforce the hard write cap: drop oldest distilled first, then oldest lines. */
+  /** Enforce the hard write cap: drop oldest model-written (distilled/agent)
+   *  entries first, then oldest lines. */
   private enforceFileCap(lines: FileLine[]): void {
     while (lines.length > CHANNEL_FILE_MAX_ENTRIES) {
-      const distilledIdx = lines.findIndex((l) => l.entry?.source === 'distilled');
-      lines.splice(distilledIdx >= 0 ? distilledIdx : 0, 1);
+      const modelIdx = lines.findIndex((l) => l.entry !== undefined && l.entry.source !== 'user');
+      lines.splice(modelIdx >= 0 ? modelIdx : 0, 1);
     }
   }
 
@@ -483,10 +500,7 @@ export class MemoryStore {
     const file = this.channelMemoryPath(platformId);
     this.ensureDir(dirname(file));
     const content = [FILE_HEADER, ...lines.map((l) => l.raw)].join('\n') + '\n';
-    const tempFile = `${file}.tmp`;
-    writeFileSync(tempFile, content, { encoding: 'utf-8', mode: 0o600 });
-    renameSync(tempFile, file);
-    chmodSync(file, 0o600);
+    writeFileAtomic(file, content);
   }
 
   private ensureDir(dir: string): void {

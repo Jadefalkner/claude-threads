@@ -42,6 +42,7 @@ import type {
   PendingExistingWorktreePrompt,
   PendingUpdatePrompt,
   PendingRoutinePrompt,
+  PendingWatchPrompt,
   PendingBugReport,
 } from './executors/types.js';
 import { PostTracker } from './post-tracker.js';
@@ -793,6 +794,19 @@ export class MessageManager {
   /** Set the pending routine-creation confirmation (one per session). */
   setPendingRoutinePrompt(prompt: PendingRoutinePrompt): void {
     this.promptExecutor.setPendingRoutinePrompt(prompt);
+  }
+
+  hasPendingRoutinePrompt(): boolean {
+    return this.promptExecutor.hasPendingRoutinePrompt();
+  }
+
+  /** Set the pending watch-creation confirmation (one per session). */
+  setPendingWatchPrompt(prompt: PendingWatchPrompt): void {
+    this.promptExecutor.setPendingWatchPrompt(prompt);
+  }
+
+  hasPendingWatchPrompt(): boolean {
+    return this.promptExecutor.hasPendingWatchPrompt();
   }
 
   // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { writeFileAtomic } from './atomic-file.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createLogger } from '../utils/logger.js';
@@ -30,6 +31,54 @@ export interface PersistedContextPrompt {
   threadMessageCount: number;
   createdAt: number;
   availableOptions: number[];
+}
+
+/**
+ * Why a session was soft-deleted. `cleanedAt` alone cannot say: it is stamped
+ * both when a session is deliberately ended and when a long-idle one is aged
+ * out, and those two want opposite behaviour on the next message.
+ *
+ * - `'stopped'` — the conversation is over. `!stop`, a kill, a normal exit.
+ *   `killSession` has already distilled it into channel memory as ended, so
+ *   reviving it would distill the same conversation a second time at its next
+ *   death. The next message must start a FRESH session.
+ * - `'stale'` — nothing ended it; it was aged out of the visible set by
+ *   `cleanStale()`. A reply in the thread is meant to bring it back, which is
+ *   why the paused-session gate looks past `cleanedAt` at all.
+ *
+ * Records written before this field existed carry no reason; see
+ * `resolveEndReason` for how they are read.
+ */
+export type EndReason = 'stopped' | 'stale';
+
+/**
+ * The end reason of a soft-deleted record, inferred for records written before
+ * `endReason` existed.
+ *
+ * ⚠️ The legacy fallback is `'stopped'`, and deliberately so: it is the safe
+ * default in both directions. Reading a stale record as stopped costs one
+ * fresh session; reading a stopped record as stale resurrects a conversation
+ * the user ended and double-counts its distillation. `isPaused` looks like a
+ * better discriminator and is not one — shutdown persists still-active
+ * sessions with `isPaused: false`, and `cleanStale()` then ages those out into
+ * `false + cleanedAt` records that are perfectly revivable.
+ */
+export function resolveEndReason(session: PersistedSession): EndReason | undefined {
+  if (!session.cleanedAt) return undefined;
+  return session.endReason ?? 'stopped';
+}
+
+/**
+ * Whether a persisted record should still answer messages in its thread —
+ * either it is live, or it is a stale tombstone a reply is meant to revive.
+ *
+ * This is THE predicate the paused-session gate and the resume sink must
+ * share. When they disagreed, a record visible to one and hidden from the
+ * other made its thread unreachable in both directions: the gate claimed the
+ * message, the sink dropped it, and the new-session path never ran.
+ */
+export function isRevivable(session: PersistedSession): boolean {
+  return resolveEndReason(session) !== 'stopped';
 }
 
 /**
@@ -89,6 +138,7 @@ export interface PersistedSession {
   resumeFailCount?: number;                      // Count of consecutive resume failures
   // History retention (soft delete)
   cleanedAt?: string;                            // ISO date when session was soft-deleted (kept for history)
+  endReason?: EndReason;                         // WHY it was soft-deleted — see EndReason
   // Multi-account support
   /**
    * Claude account id the session was started under, if the bot is configured
@@ -104,6 +154,12 @@ export interface PersistedSession {
    * this field and resume with `'full'` (today's behavior).
    */
   sessionHeaderMode?: OverheadVisibility;
+  /**
+   * True for unattended runs (routine/watch fires). Resume must keep the
+   * flag so the agent propose_* tools stay suppressed after a bot restart.
+   * Optional for backward compatibility (missing = attended).
+   */
+  unattended?: boolean;
 }
 
 /**
@@ -255,10 +311,13 @@ export class SessionStore {
    * Soft-delete a session (mark as cleaned but keep for history)
    * @param sessionId - Composite key "platformId:threadId"
    */
-  softDelete(sessionId: string): void {
+  softDelete(sessionId: string, reason: EndReason): void {
     const data = this.loadRaw();
     if (data.sessions[sessionId]) {
       data.sessions[sessionId].cleanedAt = new Date().toISOString();
+      // Required, not optional: a tombstone with no reason is the ambiguity
+      // that made `!stop` and "aged out" indistinguishable in the first place.
+      data.sessions[sessionId].endReason = reason;
       this.writeAtomic(data);
 
       const shortId = sessionId.substring(0, 20);
@@ -280,10 +339,19 @@ export class SessionStore {
       // Skip already soft-deleted sessions
       if (session.cleanedAt) continue;
 
+      // DCM sessions are channel-scoped tasks: the channel's archive/teardown
+      // owns their lifecycle, not idle age. Tombstoning one after a quiet hour
+      // makes the whole channel permanently unresponsive (every message dies
+      // on "No persisted session found").
+      if (session.threadId.startsWith('dcm:')) continue;
+
       const lastActivity = new Date(session.lastActivityAt).getTime();
       if (now - lastActivity > maxAgeMs) {
         staleIds.push(sessionId);
         session.cleanedAt = new Date().toISOString();
+        // Aged out, not ended — a reply in the thread is still meant to bring
+        // this one back. See EndReason.
+        session.endReason = 'stale';
       }
     }
 
@@ -475,12 +543,19 @@ export class SessionStore {
    * @param threadId - Thread ID within any platform
    * @returns Session data if found (including soft-deleted), undefined otherwise
    */
-  findByThreadIdAnyState(threadId: string): PersistedSession | undefined {
+  findByThreadIdAnyState(threadId: string, platformId?: string): PersistedSession | undefined {
     const data = this.loadRaw();
     for (const session of Object.values(data.sessions)) {
-      if (session.threadId === threadId) {
-        return session;
-      }
+      if (session.threadId !== threadId) continue;
+      // SECURITY: when the caller knows which platform the thread belongs to,
+      // scope to it. platformId is the store's hard privacy boundary (composite
+      // keys are `platformId:threadId`); without this, a thread id on platform
+      // B that happens to equal one persisted under platform A would resume A's
+      // session — its allowlist, working dir, worktree and Claude account —
+      // from B. Real platform ids don't collide today (Mattermost 26-char ids
+      // vs Slack dotted-ts), so this is defense-in-depth for the invariant.
+      if (platformId !== undefined && session.platformId !== platformId) continue;
+      return session;
     }
     return undefined;
   }
@@ -531,22 +606,55 @@ export class SessionStore {
   /**
    * Load raw data from file
    */
+  /**
+   * True while the most recent loadRaw() could not faithfully read an
+   * EXISTING file (parse failure, malformed sessions map). Every mutation
+   * is a synchronous loadRaw() → mutate → writeAtomic() pair, so the flag
+   * always describes the read that produced the data about to be written.
+   */
+  private lastReadDegraded = false;
+
   private loadRaw(): SessionStoreData {
     if (!existsSync(this.sessionsFile)) {
+      this.lastReadDegraded = false;
       return { version: STORE_VERSION, sessions: {} };
     }
 
     try {
-      const data = JSON.parse(readFileSync(this.sessionsFile, 'utf-8')) as SessionStoreData;
-      // Ensure required fields exist (handles malformed/empty files)
-      if (!data.sessions || typeof data.sessions !== 'object') {
+      const raw = readFileSync(this.sessionsFile, 'utf-8');
+      if (raw.trim() === '') {
+        // Zero-length/whitespace file (e.g. a crashed first write): provably
+        // nothing to lose, so it must NOT trip the degraded-read write
+        // refusal — that would leave the store permanently read-only.
+        this.lastReadDegraded = false;
+        return { version: STORE_VERSION, sessions: {} };
+      }
+      const data = JSON.parse(raw) as SessionStoreData;
+      if (!data || typeof data !== 'object') {
+        // Parsed to a scalar — unrecognizable content, refuse writes over it.
+        this.lastReadDegraded = true;
+        return { version: STORE_VERSION, sessions: {} };
+      }
+      if (data.sessions === undefined || data.sessions === null) {
+        // No sessions key at all (e.g. a bare '{}'): provably nothing to
+        // lose — an empty store that writes may safely replace (#258).
+        this.lastReadDegraded = false;
         data.sessions = {};
+      } else if (typeof data.sessions !== 'object') {
+        // A sessions value we cannot read faithfully: degrade reads, but
+        // refuse writes (see writeAtomic) — overwriting would destroy it.
+        this.lastReadDegraded = true;
+        data.sessions = {};
+      } else {
+        this.lastReadDegraded = false;
       }
       if (!data.version) {
         data.version = STORE_VERSION;
       }
       return data;
-    } catch {
+    } catch (err) {
+      log.warn(`Failed to read ${this.sessionsFile}: ${(err as Error).message} — reads degrade to empty`);
+      this.lastReadDegraded = true;
       return { version: STORE_VERSION, sessions: {} };
     }
   }
@@ -554,12 +662,19 @@ export class SessionStore {
   /**
    * Write data atomically (write to temp file, then rename)
    * Sets restrictive permissions (0600) to protect sensitive session data
+   *
+   * Refuses (logs, no throw — persist paths are fire-and-forget) when the
+   * data descends from a degraded read: sessions.json EXISTS but could not
+   * be read faithfully, so writing the degraded view would atomically
+   * destroy every persisted session across all platforms. The unreadable
+   * file stays on disk for recovery; one lost bookkeeping write is the
+   * acceptable outcome.
    */
   private writeAtomic(data: SessionStoreData): void {
-    const tempFile = `${this.sessionsFile}.tmp`;
-    writeFileSync(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
-    renameSync(tempFile, this.sessionsFile);
-    // Ensure final file has correct permissions (rename preserves temp file permissions)
-    chmodSync(this.sessionsFile, 0o600);
+    if (this.lastReadDegraded) {
+      log.error(`Refusing to write ${this.sessionsFile}: the last read of the existing file was degraded — writing would destroy persisted sessions`);
+      return;
+    }
+    writeFileAtomic(this.sessionsFile, JSON.stringify(data, null, 2));
   }
 }

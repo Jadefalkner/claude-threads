@@ -8,7 +8,8 @@
  * - Processing user responses via reactions
  */
 
-import { isApprovalEmoji, isDenialEmoji, getNumberEmojiIndex } from '../../utils/emoji.js';
+import { isApprovalEmoji, isDenialEmoji, isAllowAllEmoji, getNumberEmojiIndex } from '../../utils/emoji.js';
+import { completePendingPrompt } from './pending-prompt.js';
 import type {
   ExecutorContext,
   PromptState,
@@ -16,6 +17,7 @@ import type {
   PendingExistingWorktreePrompt,
   PendingUpdatePrompt,
   PendingRoutinePrompt,
+  PendingWatchPrompt,
 } from './types.js';
 import { BaseExecutor, type ExecutorOptions } from './base.js';
 
@@ -59,6 +61,7 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
       pendingExistingWorktreePrompt: null,
       pendingUpdatePrompt: null,
       pendingRoutinePrompt: null,
+      pendingWatchPrompt: null,
     };
   }
 
@@ -84,6 +87,9 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
       pendingRoutinePrompt: this.state.pendingRoutinePrompt
         ? { ...this.state.pendingRoutinePrompt }
         : null,
+      pendingWatchPrompt: this.state.pendingWatchPrompt
+        ? { ...this.state.pendingWatchPrompt }
+        : null,
     };
   }
 
@@ -100,8 +106,9 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
       pendingContextPrompt: persisted.pendingContextPrompt ?? null,
       pendingExistingWorktreePrompt: persisted.pendingExistingWorktreePrompt ?? null,
       pendingUpdatePrompt: persisted.pendingUpdatePrompt ?? null,
-      // Routine confirmations are transient by design — never restored.
+      // Routine/watch confirmations are transient by design — never restored.
       pendingRoutinePrompt: null,
+      pendingWatchPrompt: null,
     };
   }
 
@@ -156,51 +163,39 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
    * @param username - Username of the user who responded (for logging)
    * @param ctx - Executor context
    */
-  async handleContextPromptResponse(
+  handleContextPromptResponse(
     postId: string,
     selection: ContextPromptSelection,
     username: string,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingContextPrompt) return false;
-    if (this.state.pendingContextPrompt.postId !== postId) return false;
-
-        const { queuedPrompt, queuedFiles, queuedByUsername, threadMessageCount } = this.state.pendingContextPrompt;
-
-    // Update the post based on selection
-    let statusMessage: string;
-    if (selection === 'timeout') {
-      statusMessage = `⏱️ Continuing without context (no response)`;
-      ctx.logger.info(`Context prompt timed out, continuing without context`);
-    } else if (selection === 0) {
-      statusMessage = `✅ Continuing without context (skipped by ${ctx.formatter.formatUserMention(username)})`;
-      ctx.logger.info(`Context skipped by @${username}`);
-    } else {
-      statusMessage = `✅ Including last ${selection} messages (selected by ${ctx.formatter.formatUserMention(username)})`;
-      ctx.logger.info(`Context selection: last ${selection} messages by @${username}`);
-    }
-
-    try {
-      await ctx.platform.updatePost(postId, statusMessage);
-    } catch (err) {
-      ctx.logger.debug(`Failed to update context prompt post: ${err}`);
-    }
-
-    // Clear pending state
-    this.state.pendingContextPrompt = null;
-
-    // Emit context prompt complete event
-    if (this.events) {
-      this.events.emit('context-prompt:complete', {
-        selection,
-        queuedPrompt,
-        queuedFiles,
-        queuedByUsername,
-        threadMessageCount,
-      });
-    }
-
-    return true;
+    return completePendingPrompt({
+      pending: this.state.pendingContextPrompt,
+      postId,
+      ctx,
+      label: 'context prompt',
+      statusMessage: () => {
+        if (selection === 'timeout') {
+          ctx.logger.info(`Context prompt timed out, continuing without context`);
+          return `⏱️ Continuing without context (no response)`;
+        }
+        if (selection === 0) {
+          ctx.logger.info(`Context skipped by @${username}`);
+          return `✅ Continuing without context (skipped by ${ctx.formatter.formatUserMention(username)})`;
+        }
+        ctx.logger.info(`Context selection: last ${selection} messages by @${username}`);
+        return `✅ Including last ${selection} messages (selected by ${ctx.formatter.formatUserMention(username)})`;
+      },
+      clear: () => { this.state.pendingContextPrompt = null; },
+      emit: ({ queuedPrompt, queuedFiles, queuedByUsername, threadMessageCount }) =>
+        this.events?.emit('context-prompt:complete', {
+          selection,
+          queuedPrompt,
+          queuedFiles,
+          queuedByUsername,
+          threadMessageCount,
+        }),
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -245,47 +240,29 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
    * @param username - Username of the user who responded (for logging)
    * @param ctx - Executor context
    */
-  async handleExistingWorktreeResponse(
+  handleExistingWorktreeResponse(
     postId: string,
     decision: ExistingWorktreeDecision,
     username: string,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingExistingWorktreePrompt) return false;
-    if (this.state.pendingExistingWorktreePrompt.postId !== postId) return false;
-
-        const { branch, worktreePath } = this.state.pendingExistingWorktreePrompt;
-
-    // Update the post based on decision
-    let statusMessage: string;
-    if (decision === 'join') {
-      statusMessage = `✅ Joining existing worktree ${ctx.formatter.formatBold(branch)} (${ctx.formatter.formatUserMention(username)})`;
-      ctx.logger.info(`Joining existing worktree ${branch} by @${username}`);
-    } else {
-      statusMessage = `✅ Continuing in current directory (skipped by ${ctx.formatter.formatUserMention(username)})`;
-      ctx.logger.info(`Skipped joining existing worktree ${branch} by @${username}`);
-    }
-
-    try {
-      await ctx.platform.updatePost(postId, statusMessage);
-    } catch (err) {
-      ctx.logger.debug(`Failed to update existing worktree prompt post: ${err}`);
-    }
-
-    // Clear pending state
-    this.state.pendingExistingWorktreePrompt = null;
-
-    // Emit worktree prompt complete event
-    if (this.events) {
-      this.events.emit('worktree-prompt:complete', {
-        decision,
-        branch,
-        worktreePath,
-        username,
-      });
-    }
-
-    return true;
+    return completePendingPrompt({
+      pending: this.state.pendingExistingWorktreePrompt,
+      postId,
+      ctx,
+      label: 'existing worktree prompt',
+      statusMessage: ({ branch }) => {
+        if (decision === 'join') {
+          ctx.logger.info(`Joining existing worktree ${branch} by @${username}`);
+          return `✅ Joining existing worktree ${ctx.formatter.formatBold(branch)} (${ctx.formatter.formatUserMention(username)})`;
+        }
+        ctx.logger.info(`Skipped joining existing worktree ${branch} by @${username}`);
+        return `✅ Continuing in current directory (skipped by ${ctx.formatter.formatUserMention(username)})`;
+      },
+      clear: () => { this.state.pendingExistingWorktreePrompt = null; },
+      emit: ({ branch, worktreePath }) =>
+        this.events?.emit('worktree-prompt:complete', { decision, branch, worktreePath, username }),
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -330,41 +307,28 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
    * @param username - Username of the user who responded (for logging)
    * @param ctx - Executor context
    */
-  async handleUpdatePromptResponse(
+  handleUpdatePromptResponse(
     postId: string,
     decision: UpdatePromptDecision,
     username: string,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingUpdatePrompt) return false;
-    if (this.state.pendingUpdatePrompt.postId !== postId) return false;
-
-    
-    // Update the post based on decision
-    let statusMessage: string;
-    if (decision === 'update_now') {
-      statusMessage = `🔄 ${ctx.formatter.formatBold('Forcing update')} - restarting shortly...`;
-      ctx.logger.info(`Update prompt: forcing update now by @${username}`);
-    } else {
-      statusMessage = `⏸️ ${ctx.formatter.formatBold('Update deferred')} for 1 hour`;
-      ctx.logger.info(`Update prompt: update deferred by @${username}`);
-    }
-
-    try {
-      await ctx.platform.updatePost(postId, statusMessage);
-    } catch (err) {
-      ctx.logger.debug(`Failed to update update prompt post: ${err}`);
-    }
-
-    // Clear pending state
-    this.state.pendingUpdatePrompt = null;
-
-    // Emit update prompt complete event
-    if (this.events) {
-      this.events.emit('update-prompt:complete', { decision });
-    }
-
-    return true;
+    return completePendingPrompt({
+      pending: this.state.pendingUpdatePrompt,
+      postId,
+      ctx,
+      label: 'update prompt',
+      statusMessage: () => {
+        if (decision === 'update_now') {
+          ctx.logger.info(`Update prompt: forcing update now by @${username}`);
+          return `🔄 ${ctx.formatter.formatBold('Forcing update')} - restarting shortly...`;
+        }
+        ctx.logger.info(`Update prompt: update deferred by @${username}`);
+        return `⏸️ ${ctx.formatter.formatBold('Update deferred')} for 1 hour`;
+      },
+      clear: () => { this.state.pendingUpdatePrompt = null; },
+      emit: () => this.events?.emit('update-prompt:complete', { decision }),
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -384,35 +348,115 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
   }
 
   /**
+   * Shared body of the routine/watch creation-confirmation handlers: match
+   * the pending prompt to the reacted post, update the confirmation card,
+   * clear the pending state, and hand the typed payload to `emit`. The
+   * public wrappers below keep the per-flavor typed events — those are
+   * load-bearing for the lifecycle listeners.
+   */
+  private async completeCreationPrompt<P extends { name: string }>(
+    pending: { postId: string; parsed: P; requestedBy: string; proposedByAgent?: boolean } | null,
+    label: string,
+    clear: () => void,
+    emit: (payload: { approved: boolean; parsed: P; requestedBy: string; decidedBy: string; postId: string; proposedByAgent?: boolean; requireApproval: boolean }) => void,
+    postId: string,
+    approved: boolean,
+    requireApproval: boolean,
+    username: string,
+    ctx: ExecutorContext,
+  ): Promise<boolean> {
+    // Agent proposals skip the owner gate the `!routine`/`!watch` commands
+    // apply at request time, so the DECISION is owner-gated here instead —
+    // and gated BEFORE the pending prompt is consumed: an unauthorized
+    // participant's reaction (either way) must not burn the one pending
+    // slot, or any invited guest could veto every proposal. The pending
+    // stays parked; the owner's later reaction still decides it.
+    // (requestedBy is the session owner for agent proposals by contract;
+    // lifecycle re-checks the same rule at save time as defense in depth.)
+    if (
+      pending?.proposedByAgent &&
+      pending.postId === postId &&
+      username !== pending.requestedBy &&
+      !ctx.platform.isUserAllowed(username)
+    ) {
+      // Warn once per pending proposal: a guest toggling reactions must
+      // not be able to spam the thread with one warning per toggle.
+      if (!(pending as { unauthorizedWarned?: boolean }).unauthorizedWarned) {
+        (pending as { unauthorizedWarned?: boolean }).unauthorizedWarned = true;
+        await ctx.createPost(
+          `⚠️ Only ${ctx.formatter.formatUserMention(pending.requestedBy)} or allowed users can decide a ${label.toLowerCase()} Claude proposed.`,
+          { type: 'system' },
+        );
+      }
+      return true;
+    }
+    return completePendingPrompt({
+      pending,
+      postId,
+      ctx,
+      label: `${label.toLowerCase()} prompt`,
+      statusMessage: ({ parsed }) => approved
+        ? `✅ ${ctx.formatter.formatBold(`${label} "${parsed.name}" confirmed`)} by ${ctx.formatter.formatUserMention(username)} — saving...`
+        : `❌ ${ctx.formatter.formatBold(`${label} "${parsed.name}" discarded`)} by ${ctx.formatter.formatUserMention(username)}`,
+      clear,
+      emit: ({ parsed, requestedBy }) => emit({ approved, parsed, requestedBy, decidedBy: username, postId, proposedByAgent: pending?.proposedByAgent, requireApproval }),
+    });
+  }
+
+  /**
    * Handle a routine confirmation reaction. Emits 'routine-prompt:complete';
    * the lifecycle listener does the actual store write on approval.
    */
-  async handleRoutinePromptResponse(
+  handleRoutinePromptResponse(
     postId: string,
     approved: boolean,
+    requireApproval: boolean,
     username: string,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingRoutinePrompt) return false;
-    if (this.state.pendingRoutinePrompt.postId !== postId) return false;
+    return this.completeCreationPrompt(
+      this.state.pendingRoutinePrompt,
+      'Routine',
+      () => { this.state.pendingRoutinePrompt = null; },
+      (payload) => this.events?.emit('routine-prompt:complete', payload),
+      postId, approved, requireApproval, username, ctx,
+    );
+  }
 
-    const { parsed, requestedBy } = this.state.pendingRoutinePrompt;
+  // ---------------------------------------------------------------------------
+  // Watch-creation confirmation methods
+  // ---------------------------------------------------------------------------
 
-    const statusMessage = approved
-      ? `✅ ${ctx.formatter.formatBold(`Routine "${parsed.name}" confirmed`)} by ${ctx.formatter.formatUserMention(username)} — saving...`
-      : `❌ ${ctx.formatter.formatBold(`Routine "${parsed.name}" discarded`)} by ${ctx.formatter.formatUserMention(username)}`;
-    try {
-      await ctx.platform.updatePost(postId, statusMessage);
-    } catch (err) {
-      ctx.logger.debug(`Failed to update routine prompt post: ${err}`);
-    }
+  /**
+   * Set the pending watch-creation confirmation. One at a time per session;
+   * a newer request replaces an unanswered older one.
+   */
+  setPendingWatchPrompt(prompt: PendingWatchPrompt): void {
+    this.state.pendingWatchPrompt = prompt;
+  }
 
-    this.state.pendingRoutinePrompt = null;
+  hasPendingWatchPrompt(): boolean {
+    return this.state.pendingWatchPrompt !== null;
+  }
 
-    if (this.events) {
-      this.events.emit('routine-prompt:complete', { approved, parsed, requestedBy, postId });
-    }
-    return true;
+  /**
+   * Handle a watch confirmation reaction. Emits 'watch-prompt:complete';
+   * the lifecycle listener does the actual store write on approval.
+   */
+  handleWatchPromptResponse(
+    postId: string,
+    approved: boolean,
+    requireApproval: boolean,
+    username: string,
+    ctx: ExecutorContext
+  ): Promise<boolean> {
+    return this.completeCreationPrompt(
+      this.state.pendingWatchPrompt,
+      'Watch',
+      () => { this.state.pendingWatchPrompt = null; },
+      (payload) => this.events?.emit('watch-prompt:complete', payload),
+      postId, approved, requireApproval, username, ctx,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -507,17 +551,58 @@ export class PromptExecutor extends BaseExecutor<PromptState> {
       return false;
     }
 
-    // Check pending routine-creation confirmation
+    // Check pending routine-creation confirmation.
+    //   👍  save, approvals required (safe default)
+    //   ✅  save, run autonomously (no per-action approval) — human creations only
+    //   👎  discard
+    // Agent-proposed items never offer the autonomous option: an autonomous
+    // unattended item is a deliberate human choice, so a ✅ on an agent
+    // proposal is treated as the safe "approvals required" save.
     if (this.state.pendingRoutinePrompt?.postId === postId) {
+      const pending = this.state.pendingRoutinePrompt;
       if (isApprovalEmoji(emoji)) {
-        ctx.logger.debug(`Routine prompt reaction from @${user}: approve`);
-        return this.handleRoutinePromptResponse(postId, true, user, ctx);
+        ctx.logger.debug(`Routine prompt reaction from @${user}: approve (approvals required)`);
+        return this.handleRoutinePromptResponse(postId, true, true, user, ctx);
+      }
+      if (isAllowAllEmoji(emoji)) {
+        // Choosing the autonomous posture is an owner privilege: only the
+        // requester (owner, for human cards) or a platform-allowlisted user may
+        // remove the per-action approval prompts. A non-owner participant's ✅
+        // is downgraded to approvals-required. Agent proposals never go
+        // autonomous (their `requestedBy` is the owner, but the owner gate at
+        // decision time already blocks a guest; the safe posture holds here too).
+        const autonomousAuthorized = pending.proposedByAgent !== true &&
+          (user === pending.requestedBy || ctx.platform.isUserAllowed(user));
+        ctx.logger.debug(`Routine prompt reaction from @${user}: approve (autonomous=${autonomousAuthorized})`);
+        return this.handleRoutinePromptResponse(postId, true, !autonomousAuthorized, user, ctx);
       }
       if (isDenialEmoji(emoji)) {
         ctx.logger.debug(`Routine prompt reaction from @${user}: discard`);
-        return this.handleRoutinePromptResponse(postId, false, user, ctx);
+        return this.handleRoutinePromptResponse(postId, false, true, user, ctx);
       }
       ctx.logger.debug(`PromptExecutor: emoji ${emoji} not valid for routine prompt, ignoring`);
+      return false;
+    }
+
+    if (this.state.pendingWatchPrompt?.postId === postId) {
+      const pending = this.state.pendingWatchPrompt;
+      if (isApprovalEmoji(emoji)) {
+        ctx.logger.debug(`Watch prompt reaction from @${user}: approve (approvals required)`);
+        return this.handleWatchPromptResponse(postId, true, true, user, ctx);
+      }
+      if (isAllowAllEmoji(emoji)) {
+        // Owner-gated autonomous posture (see the routine branch above): a
+        // non-owner participant's ✅ is downgraded to approvals-required.
+        const autonomousAuthorized = pending.proposedByAgent !== true &&
+          (user === pending.requestedBy || ctx.platform.isUserAllowed(user));
+        ctx.logger.debug(`Watch prompt reaction from @${user}: approve (autonomous=${autonomousAuthorized})`);
+        return this.handleWatchPromptResponse(postId, true, !autonomousAuthorized, user, ctx);
+      }
+      if (isDenialEmoji(emoji)) {
+        ctx.logger.debug(`Watch prompt reaction from @${user}: discard`);
+        return this.handleWatchPromptResponse(postId, false, true, user, ctx);
+      }
+      ctx.logger.debug(`PromptExecutor: emoji ${emoji} not valid for watch prompt, ignoring`);
       return false;
     }
 

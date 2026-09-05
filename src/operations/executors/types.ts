@@ -11,6 +11,7 @@ import type { ContentBreaker } from '../content-breaker.js';
 import type { Logger } from '../../utils/logger.js';
 import type { ThreadLogger } from '../../persistence/thread-logger.js';
 import type { ParsedRoutineRequest } from '../../routines/parser.js';
+import type { ParsedWatchRequest } from '../../watches/parser.js';
 
 // ---------------------------------------------------------------------------
 // Executor Context
@@ -103,6 +104,15 @@ export interface PendingMessageApproval {
   postId: string;
   originalMessage: string;
   fromUser: string;
+  /**
+   * The session owner (`startedBy`) at the time the approval was requested.
+   * Used to gate the "✅ Invite to session" decision: granting standing
+   * session membership is an owner privilege (parity with the owner-gated
+   * `!invite` command), so a non-owner participant's ✅ is downgraded to a
+   * one-shot allow. Optional for backward-compat with approvals persisted by
+   * older versions (a missing value falls back to platform-allowlist only).
+   */
+  sessionOwner?: string;
 }
 
 /**
@@ -157,6 +167,27 @@ export interface PendingRoutinePrompt {
   parsed: ParsedRoutineRequest;
   /** Who asked for the routine — becomes `createdBy` on approval. */
   requestedBy: string;
+  /** True when Claude proposed this via the propose_routine MCP tool
+   *  (requestedBy is then the session owner it runs as). */
+  proposedByAgent?: boolean;
+  /** Set after the first unauthorized-reaction warning (spam guard). */
+  unauthorizedWarned?: boolean;
+}
+
+/**
+ * A watch (event trigger) proposal shown to the user, awaiting a 👍/👎
+ * reaction before anything is saved. Transient like the routine prompt.
+ */
+export interface PendingWatchPrompt {
+  postId: string;
+  /** Haiku-parsed watch, revalidated (see src/watches/parser.ts). */
+  parsed: ParsedWatchRequest;
+  /** Who asked for the watch — becomes `createdBy` on approval. */
+  requestedBy: string;
+  /** True when Claude proposed this via the propose_watch MCP tool. */
+  proposedByAgent?: boolean;
+  /** Set after the first unauthorized-reaction warning (spam guard). */
+  unauthorizedWarned?: boolean;
 }
 
 /**
@@ -220,6 +251,8 @@ export interface PromptState {
   pendingUpdatePrompt: PendingUpdatePrompt | null;
   /** Pending routine-creation confirmation (transient, never persisted) */
   pendingRoutinePrompt: PendingRoutinePrompt | null;
+  /** Pending watch-creation confirmation (transient, never persisted) */
+  pendingWatchPrompt: PendingWatchPrompt | null;
 }
 
 /**
