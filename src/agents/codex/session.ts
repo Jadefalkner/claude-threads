@@ -345,8 +345,16 @@ export class CodexSession extends EventEmitter implements AgentSession {
       case 'error': {
         const err = p.error as { message?: string; codexErrorInfo?: unknown } | undefined;
         const message = err?.message ?? 'unknown codex error';
-        this.log.error(`codex error (willRetry=${String(p.willRetry)}): ${message}`);
-        if (/unauthori|login|auth/i.test(message)) this.permanentFailure = message;
+        const info = typeof err?.codexErrorInfo === 'string' ? err.codexErrorInfo : JSON.stringify(err?.codexErrorInfo ?? null);
+        this.log.error(`codex error (willRetry=${String(p.willRetry)}, ${info}): ${message}`);
+        // Auth problems need a human (`codex login`): flag them permanent so
+        // lifecycle stops retrying resumes, and say so in the chat.
+        if (/unauthori|log ?in|sign in|refresh token|access token|auth/i.test(message)) this.permanentFailure = message;
+        if (!p.willRetry) {
+          // A failed turn otherwise ends silently in the chat (result events
+          // carry no visible text): surface the reason as agent text.
+          this.assistant({ type: 'text', text: `❌ Codex: ${message}` });
+        }
         // "You've hit your usage limit ... try again at Sep 6th, 2026 12:28 AM."
         // (codex 0.153.4, ChatGPT plan). Same cooldown path as Claude's detector.
         if (err?.codexErrorInfo === 'usageLimitExceeded' || /usage limit/i.test(message)) {
