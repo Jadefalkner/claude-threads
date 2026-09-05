@@ -8,7 +8,7 @@
  * - Processing user responses via reactions
  */
 
-import { NUMBER_EMOJIS, APPROVAL_EMOJIS, DENIAL_EMOJIS, isApprovalEmoji, isDenialEmoji, getNumberEmojiIndex } from '../../utils/emoji.js';
+import { NUMBER_EMOJIS, APPROVAL_EMOJIS, DENIAL_EMOJIS, isApprovalEmoji, isDenialEmoji, getNumberEmojiIndex, isAllowAllEmoji, ALLOW_ALL_EMOJIS } from '../../utils/emoji.js';
 import { auditLog } from '../../persistence/audit-log.js';
 import { formatShortId } from '../../utils/format.js';
 import { completePendingPrompt } from './pending-prompt.js';
@@ -181,14 +181,18 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       }
       message +=
         `👍 Approve\n` +
-        `👎 Deny\n\n` +
+        `👎 Deny\n` +
+        `✅ Approve for the rest of this session\n\n` +
         ctx.formatter.formatItalic('React to respond');
     }
 
     // Create interactive post with approval reactions
     const post = await ctx.createInteractivePost(
       message,
-      [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]],
+      // ✅ only for actions — plans have no session-wide variant
+      op.approvalType === 'plan'
+        ? [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]]
+        : [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0], ALLOW_ALL_EMOJIS[0]],
       {
         type: 'plan_approval',
         interactionType: 'plan_approval',
@@ -317,7 +321,8 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
   handleApprovalResponse(
     postId: string,
     approved: boolean,
-    ctx: ExecutorContext
+    ctx: ExecutorContext,
+    allowAll = false
   ): Promise<boolean> {
     return completePendingPrompt({
       pending: this.state.pendingApproval,
@@ -326,12 +331,13 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       label: 'approval',
       statusMessage: ({ type }) => {
         ctx.logger.info(`${type} ${approved ? 'approved' : 'rejected'}`);
+        if (allowAll) return `✅ ${ctx.formatter.formatBold('Action approved for the rest of this session')} - proceeding...`;
         return approved
           ? `✅ ${ctx.formatter.formatBold(type === 'plan' ? 'Plan approved' : 'Action approved')} - proceeding...`
           : `❌ ${ctx.formatter.formatBold(type === 'plan' ? 'Changes requested' : 'Action denied')}`;
       },
       clear: () => { this.state.pendingApproval = null; },
-      emit: ({ toolUseId }) => this.events?.emit('approval:complete', { toolUseId, approved }),
+      emit: ({ toolUseId }) => this.events?.emit('approval:complete', { toolUseId, approved, allowAll }),
     });
   }
 
@@ -420,6 +426,12 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
         const handled = await this.handleApprovalResponse(postId, true, ctx);
         ctx.logger.debug(`QuestionApprovalExecutor: approval outcome=approved, handled=${handled}`);
         return handled;
+      }
+      // ✅ = allow-all: approve and stop prompting for the rest of the session.
+      // Action prompts only (Codex backend); plan approvals keep ignoring it.
+      if (approvalType === 'action' && isAllowAllEmoji(emoji)) {
+        ctx.logger.debug(`Allow-all reaction from @${user}: approved for session`);
+        return this.handleApprovalResponse(postId, true, ctx, true);
       }
       if (isDenialEmoji(emoji)) {
         ctx.logger.debug(`Approval reaction from @${user}: denied`);

@@ -1,6 +1,7 @@
+import type { AgentBackend } from '../agents/types.js';
+import { stateHome } from '../utils/state-home.js';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { writeFileAtomic } from './atomic-file.js';
-import { homedir } from 'os';
 import { join } from 'path';
 import { createLogger } from '../utils/logger.js';
 import { milestoneReached } from '../sponsor.js';
@@ -88,6 +89,7 @@ export interface PersistedSession {
   platformId: string;            // Which platform instance (e.g., 'default', 'mattermost-main')
   threadId: string;              // Thread ID within that platform
   claudeSessionId: string;       // UUID for --session-id / --resume
+  agentBackend?: AgentBackend;   // 'claude' | 'codex'; absent on pre-backend data → claude
   startedBy: string;             // Username who started the session
   startedByDisplayName?: string; // Display name for UI
   startedAt: string;             // ISO date
@@ -188,7 +190,7 @@ interface SessionStoreData {
 }
 
 const STORE_VERSION = 2; // v2: Added platformId for multi-platform support
-const DEFAULT_CONFIG_DIR = join(homedir(), '.config', 'claude-threads');
+const DEFAULT_CONFIG_DIR = join(stateHome(), '.config', 'claude-threads');
 const DEFAULT_SESSIONS_FILE = join(DEFAULT_CONFIG_DIR, 'sessions.json');
 
 /**

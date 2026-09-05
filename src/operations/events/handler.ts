@@ -16,6 +16,9 @@ import { withErrorHandling } from '../../utils/error-handler/index.js';
 import { resetSessionActivity, post, postError, updatePost } from '../post-helpers/index.js';
 import type { SessionContext } from '../session-context/index.js';
 import { createLogger } from '../../utils/logger.js';
+import { realpathSync } from 'fs';
+import { homedir } from 'os';
+import { join, sep } from 'path';
 import { auditDetailForTool, auditLog, isAuditEnabled } from '../../persistence/audit-log.js';
 import { createSessionLog } from '../../utils/session-log.js';
 import { extractPullRequestUrl } from '../../utils/pr-detector.js';
@@ -168,6 +171,16 @@ function isSidechainEvent(event: ClaudeEvent): boolean {
  * Pre-processing for events when using MessageManager.
  * Handles session-specific side effects that should run BEFORE the main event handling.
  */
+function isInsideDir(path: string, dir: string): boolean {
+  try {
+    const real = realpathSync(path);
+    const base = realpathSync(dir);
+    return real === base || real.startsWith(base.endsWith(sep) ? base : base + sep);
+  } catch {
+    return false;
+  }
+}
+
 export function handleEventPreProcessing(
   session: Session,
   event: ClaudeEvent,
@@ -175,6 +188,50 @@ export function handleEventPreProcessing(
 ): void {
   // Log raw event to thread logger (first thing, before any processing)
   session.threadLogger?.logEvent(event);
+
+  // Codex-only: the agent declined an approval after its timeout. Resolve the
+  // still-open prompt post as denied so a later reaction can't show
+  // "approved" for an action Codex never ran. (The request itself is
+  // rendered by the transformer as an 'action' approval op; the decision
+  // flows back via lifecycle's 'approval:complete' → respondToApproval.)
+  if (event.type === 'approval_timeout' && session.messageManager) {
+    const requestId = (event as ClaudeEvent & { request_id?: string }).request_id;
+    const pending = session.messageManager.getPendingApproval();
+    if (requestId && pending?.toolUseId === requestId) {
+      void session.messageManager.handleApprovalResponse(pending.postId, false);
+    }
+  }
+
+  // Codex-only: the agent gave up waiting for answers. Drop the executor's
+  // pending question set so a late click on the stale post is ignored
+  // instead of being reported as an answer.
+  if (event.type === 'question_timeout' && session.messageManager) {
+    const requestId = (event as ClaudeEvent & { request_id?: string }).request_id;
+    const pending = session.messageManager.getPendingQuestionSet();
+    if (requestId && pending?.toolUseId === requestId) {
+      session.messageManager.clearPendingQuestionSet();
+      sessionLog(session).info(`Question set ${requestId} expired; ignoring late answers`);
+    }
+  }
+
+  // Codex-only: a file the agent produced natively (image generation). Upload
+  // it into the thread. Only files under Codex's own output directory are
+  // accepted — this path never goes through the MCP working-dir validator.
+  if (event.type === 'agent_file') {
+    const e = event as ClaudeEvent & { path?: string; caption?: string };
+    const codexOut = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'generated_images');
+    const upload = (session.platform as { uploadFile?: (p: string, t: string, o?: { caption?: string }) => Promise<unknown> }).uploadFile;
+    if (e.path && upload && isInsideDir(e.path, codexOut)) {
+      const path = e.path;
+      const caption = e.caption?.slice(0, 300);
+      void withErrorHandling(
+        () => upload.call(session.platform, path, session.threadId, caption ? { caption } : undefined),
+        { action: 'Upload agent-generated file', session },
+      );
+    } else {
+      sessionLog(session).warn(`agent_file ignored: ${e.path ?? '(no path)'} is not under ${codexOut}`);
+    }
+  }
 
   // Audit trail (opt-in per platform): record every tool call, including
   // subagent sidechains — an auditor wants the full execution record even
@@ -230,12 +287,22 @@ export function handleEventPreProcessing(
       compact_metadata?: unknown;
       slash_commands?: string[];
       model?: string;
+      session_id?: string;
     };
 
     // Capture the current model from init events (re-emitted per turn, so a
     // /model switch is reflected on the very next turn — see captures).
     if (e.subtype === 'init' && typeof e.model === 'string') {
       session.currentModel = e.model;
+    }
+
+    // The backend owns the resumable id. Claude echoes the id we passed;
+    // Codex mints its own thread id on thread/start — adopt it here, after
+    // the start succeeded, so a later resume targets the real thread.
+    if (e.subtype === 'init' && typeof e.session_id === 'string' && e.session_id !== session.claudeSessionId) {
+      sessionLog(session).info(`Adopting backend session id ${e.session_id}`);
+      session.claudeSessionId = e.session_id;
+      ctx.ops.persistSession(session);
     }
 
     // Capture available slash commands from init event
