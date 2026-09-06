@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { stateHome } from './state-home.js';
 
@@ -7,28 +7,43 @@ import { stateHome } from './state-home.js';
  * ~/.config/claude-threads would race on sessions.json and each other's
  * uploads; a stale lock (dead pid) is taken over.
  *
- * Creation is atomic (O_EXCL): two processes starting at once cannot both
- * win — the loser sees EEXIST, reads the winner's pid and refuses.
+ * Without flock() in the runtime, exclusivity comes from two atomic
+ * primitives: the pid is written to a private temp file and link()ed onto
+ * the lock path (fails with EEXIST if a lock exists; the lock file therefore
+ * never exists without content), and a stale lock is claimed by rename()ing
+ * it aside — only one of several concurrent claimants gets the rename, the
+ * others see ENOENT and go round again, where they either win the link or
+ * find the winner's live pid.
  * Returns a release function; throws when another live process holds the lock.
  */
 export function acquireInstanceLock(): () => void {
   const path = join(stateHome(), '.config', 'claude-threads', 'instance.lock');
   mkdirSync(dirname(path), { recursive: true });
-  // Two attempts: the second one runs after a stale lock was unlinked.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      writeFileSync(path, String(process.pid), { flag: 'wx' });
-      return () => release(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  const tmp = `${path}.${process.pid}`;
+  writeFileSync(tmp, String(process.pid));
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        linkSync(tmp, path);
+        return () => release(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      }
+      const pid = readPid(path);
+      if (pid === process.pid) return () => release(path);
+      if (pid && isAlive(pid)) {
+        throw new Error(`another claude-threads instance (pid ${pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
+      }
+      // Dead holder (or the file vanished between link and read): claim it.
+      try {
+        renameSync(path, `${path}.stale`);
+        unlinkSync(`${path}.stale`);
+      } catch { /* another claimant got there first; retry the link */ }
     }
-    const pid = readPid(path);
-    if (pid && pid !== process.pid && isAlive(pid)) {
-      throw new Error(`another claude-threads instance (pid ${pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
-    }
-    try { unlinkSync(path); } catch { /* someone else removed it first */ }
+    throw new Error(`could not acquire ${path}: lost the race three times`);
+  } finally {
+    try { unlinkSync(tmp); } catch { /* already gone */ }
   }
-  throw new Error(`could not acquire ${path}: lost the race twice`);
 }
 
 /** Only remove the lock while it still carries our pid — never a successor's. */

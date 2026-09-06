@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { acquireInstanceLock } from './instance-lock.js';
+import { stateHome } from './state-home.js';
 
 function withHome(fn: (lock: string) => void): void {
   const home = mkdtempSync(join(tmpdir(), 'ct-lock-'));
@@ -36,6 +37,15 @@ describe('acquireInstanceLock', () => {
       acquireInstanceLock()(); // 'wx' fails on the existing file, own pid is not a foreign holder
       expect(existsSync(lock)).toBe(false);
     });
+  });
+
+  test('resolves a relative CLAUDE_THREADS_HOME against cwd', () => {
+    process.env.CLAUDE_THREADS_HOME = './rel-state-home';
+    try {
+      expect(stateHome()).toBe(join(process.cwd(), 'rel-state-home'));
+    } finally {
+      delete process.env.CLAUDE_THREADS_HOME;
+    }
   });
 
   test('release does not remove a lock that a successor took over', () => {
