@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, renameSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { acquireInstanceLock } from './instance-lock.js';
@@ -39,27 +39,15 @@ describe('acquireInstanceLock', () => {
     });
   });
 
-  test('a holder displaced during the grace period loses, the replacer keeps the lock', () => {
+  test('takes over a stale lock and leaves no stray files', () => {
     withHome((lock) => {
-      // Simulate a stale-lock claimant that replaces the file while we wait.
-      const replaced = `${lock}.other`;
-      const timer = setTimeout(() => {}, 0); // keep the event loop alive during the sync wait
       mkdirSync(join(lock, '..'), { recursive: true });
-      writeFileSync(replaced, String(process.ppid));
-      // Our acquire links first, then sleeps GRACE_MS; the rename lands before it re-checks.
-      const original = Atomics.wait;
-      (Atomics as { wait: typeof Atomics.wait }).wait = ((...args: Parameters<typeof Atomics.wait>) => {
-        renameSync(replaced, lock);
-        return original(...args);
-      }) as typeof Atomics.wait;
-      try {
-        expect(() => acquireInstanceLock()).toThrow(/won the start race/);
-      } finally {
-        (Atomics as { wait: typeof Atomics.wait }).wait = original;
-        clearTimeout(timer);
-      }
-      expect(readFileSync(lock, 'utf8')).toBe(String(process.ppid));
-      expect(existsSync(`${lock}.${process.pid}`)).toBe(false);
+      writeFileSync(lock, '999999999');
+      const release = acquireInstanceLock();
+      expect(readFileSync(lock, 'utf8')).toBe(String(process.pid));
+      expect(readdirSync(join(lock, '..'))).toEqual(['instance.lock']);
+      release();
+      expect(readdirSync(join(lock, '..'))).toEqual([]);
     });
   });
 

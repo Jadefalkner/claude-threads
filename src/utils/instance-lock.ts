@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { stateHome } from './state-home.js';
 
@@ -6,26 +6,19 @@ import { stateHome } from './state-home.js';
 export const LOCKED_EXIT_CODE = 3;
 
 /**
- * How long a new holder waits before confirming the lock is still its own.
- * A stale-lock claimant replaces the lock a few microseconds after reading
- * the dead pid; anyone it displaced notices within this grace period.
- * ponytail: a claimant stalled between read and rename for longer than this
- * (SIGSTOP, VM pause) can still displace a live holder; flock() if it ever matters
- */
-const GRACE_MS = 50;
-
-/**
  * One bot process per state directory. Two instances sharing
  * ~/.config/claude-threads would race on sessions.json and each other's
  * uploads; a stale lock (dead pid) is taken over.
  *
- * No process ever unlinks another's lock. The pid is written to a private
- * temp file and link()ed onto the lock path — EEXIST means someone holds it,
- * and the lock never exists without content. A stale lock is replaced with
- * rename(), which is atomic; because a replacement could in principle hit a
- * lock that was itself just acquired, every acquirer re-checks after
- * GRACE_MS that the lock path still resolves to its own inode and gives up
- * otherwise. Of any number of simultaneous starters, exactly one survives.
+ * Node 20 has no flock(), so exclusivity is built from the two exclusive
+ * filesystem primitives that exist: link() never overwrites (EEXIST means a
+ * lock is held, and the lock never exists without content because the pid
+ * is written to a private temp file first), and rename() moves a given
+ * inode exactly once (of several claimants of the same stale lock, one gets
+ * the rename, the rest see ENOENT). A claimant checks the inode it moved
+ * against the one it inspected; if a fresh lock had landed in between, the
+ * fresh lock is put back with link() and the claimant goes round again to
+ * find its live holder. No process ever unlinks another's lock.
  * Returns a release function; throws when another live process holds the lock.
  */
 export function acquireInstanceLock(): () => void {
@@ -34,30 +27,47 @@ export function acquireInstanceLock(): () => void {
   const tmp = `${path}.${process.pid}`;
   writeFileSync(tmp, String(process.pid));
   try {
-    const ino = statSync(tmp).ino;
-    if (!tryLink(tmp, path)) {
-      const pid = readPid(path);
-      if (pid === process.pid) return () => release(path);
-      if (pid && isAlive(pid)) {
-        throw new Error(`another claude-threads instance (pid ${pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (tryLink(tmp, path)) return () => release(path);
+      const seen = inspect(path);
+      if (!seen) continue; // vanished between link and read (holder released): retry the link
+      if (seen.pid === process.pid) return () => release(path);
+      if (seen.pid && isAlive(seen.pid)) {
+        throw new Error(`another claude-threads instance (pid ${seen.pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
       }
-      // Dead holder, or the file vanished between link and read: take over.
-      renameSync(tmp, path);
+      // Dead holder: move exactly that inode aside; rename() hands it to one claimant only.
+      const aside = `${path}.stale.${process.pid}`;
+      if (!tryRename(path, aside)) continue; // ENOENT: another claimant moved it first
+      if (statSync(aside).ino !== seen.ino) {
+        // We moved a lock that was linked after our inspection; its holder is
+        // alive. link() never overwrites, so a lock that landed meanwhile stays.
+        // ponytail: if one did land in that gap, the displaced holder runs on
+        // unlocked — the last window only flock() closes, and Node 20 has none
+        tryLink(aside, path);
+        unlinkSync(aside);
+        continue;
+      }
+      unlinkSync(aside); // the stale inode, and nothing else, is gone
     }
-    sleepMs(GRACE_MS);
-    if (statSync(path).ino !== ino) {
-      throw new Error(`another claude-threads instance won the start race for ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
-    }
-    return () => release(path);
+    throw new Error(`could not acquire ${path}: lost the race five times`);
   } finally {
-    try { unlinkSync(tmp); } catch { /* renamed away or already gone */ }
+    try { unlinkSync(tmp); } catch { /* already gone */ }
   }
 }
 
-/** link() the temp file onto the lock path; false when a lock already exists. */
-function tryLink(tmp: string, path: string): boolean {
+/** Read pid and inode from the same open file, so both describe one lock. */
+function inspect(path: string): { pid: number | undefined; ino: number } | undefined {
+  let fd: number;
+  try { fd = openSync(path, 'r'); } catch { return undefined; }
   try {
-    linkSync(tmp, path);
+    return { pid: Number(readFileSync(fd, 'utf8').trim()) || undefined, ino: fstatSync(fd).ino };
+  } finally { closeSync(fd); }
+}
+
+/** link() the temp file onto the lock path; false when a lock already exists. */
+function tryLink(src: string, path: string): boolean {
+  try {
+    linkSync(src, path);
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
@@ -65,21 +75,24 @@ function tryLink(tmp: string, path: string): boolean {
   }
 }
 
+/** rename(); false when the source is already gone. */
+function tryRename(from: string, to: string): boolean {
+  try {
+    renameSync(from, to);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
 /** Only remove the lock while it still carries our pid — never a successor's. */
 function release(path: string): void {
   try {
-    if (readPid(path) === process.pid) unlinkSync(path);
+    if (inspect(path)?.pid === process.pid) unlinkSync(path);
   } catch { /* already gone */ }
-}
-
-function readPid(path: string): number | undefined {
-  try { return Number(readFileSync(path, 'utf8').trim()) || undefined; } catch { return undefined; }
 }
 
 function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM'; }
-}
-
-function sleepMs(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
