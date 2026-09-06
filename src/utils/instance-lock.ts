@@ -46,6 +46,11 @@ export function acquireInstanceLock(): () => void {
       if (!seen) continue; // vanished between link and read (holder released): retry the link
       if (seen.pid === process.pid) return () => release(path);
       if (seen.pid && isAlive(seen.pid)) {
+        // TODO: the interactive self-respawn spawns its replacement while the
+        // old process is still alive; the replacement only lands here if it
+        // beats the old process's exit handler, which is a wide margin today.
+        // A short retry on a live holder would close it without touching the
+        // respawn code.
         throw new Error(
           `another claude-threads instance (pid ${seen.pid}) already uses ${dirname(path)} — ` +
           `set CLAUDE_THREADS_HOME to run a second bot; if pid ${seen.pid} is not a claude-threads process, delete ${path}`,
