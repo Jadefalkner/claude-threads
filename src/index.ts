@@ -45,7 +45,7 @@ import {
   getRuntimeSettings,
   clearRuntimeSettings,
 } from './auto-update/installer.js';
-import { acquireInstanceLock } from './utils/instance-lock.js';
+import { acquireInstanceLock, LOCKED_EXIT_CODE } from './utils/instance-lock.js';
 
 // =============================================================================
 // Platform Factory and Event Wiring
@@ -422,7 +422,7 @@ async function startWithoutDaemon() {
   } catch (err) {
     console.error(red(`  ❌ ${err instanceof Error ? err.message : String(err)}`));
     console.error('');
-    process.exit(1);
+    process.exit(LOCKED_EXIT_CODE); // terminal for the daemon wrapper: restarting would only collide again
   }
   process.on('exit', () => releaseInstanceLock());
 
