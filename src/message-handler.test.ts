@@ -67,6 +67,7 @@ function createMockSessionManager() {
     },
     getPersistedSession: mock(() => undefined),
     killAllSessions: mock(async () => {}),
+    transcribeForWatch: mock(async () => ''),
     cancelSession: mock(async () => {}),
     interruptSession: mock(async () => {}),
     inviteUser: mock(async () => {}),
@@ -2611,6 +2612,91 @@ describe('handleMessage - legacy paused-session resume', () => {
   });
 });
 
+describe('handleMessage - a voice note is evaluated as its words', () => {
+  let client: ReturnType<typeof createMockPlatform>;
+  let session: ReturnType<typeof createMockSessionManager>;
+  let options: MessageHandlerOptions;
+
+  beforeEach(() => {
+    client = createMockPlatform();
+    session = createMockSessionManager();
+    options = { platformId: 'test-platform' };
+  });
+
+  const voiceNote: PlatformPost = {
+    id: 'post1',
+    platformId: 'test',
+    channelId: 'channel1',
+    userId: 'user1',
+    message: '',
+    rootId: '',
+    createAt: Date.now(),
+    metadata: { files: [{ id: 'f1', name: 'voice.webm', mimeType: 'audio/webm' }] },
+  } as unknown as PlatformPost;
+  const user: PlatformUser = { id: 'user1', username: 'allowed-user', displayName: 'User' };
+
+  test('the transcript, not the empty message, is what the evaluator sees', async () => {
+    // A watch on "deploy" has to fire when somebody SAYS deploy. Without this
+    // the evaluator receives '' and a file beside it, so voice notes are
+    // invisible to every watch in the channel — the transcript would be a
+    // courtesy for human readers and nothing more.
+    (session.transcribeForWatch as any).mockResolvedValue('please deploy the trader');
+
+    await handleMessage(client, session, voiceNote, user, options);
+
+    expect(session.evaluateWatches).toHaveBeenCalledTimes(1);
+    const evaluated = (session.evaluateWatches as any).mock.calls[0][3];
+    expect(evaluated).toContain('please deploy the trader');
+  });
+
+  test('a typed message is unchanged when there is nothing spoken', async () => {
+    (session.transcribeForWatch as any).mockResolvedValue('');
+
+    await handleMessage(
+      client,
+      session,
+      { ...voiceNote, message: 'ship it', metadata: undefined } as PlatformPost,
+      user,
+      options,
+    );
+
+    expect((session.evaluateWatches as any).mock.calls[0][3]).toBe('ship it');
+  });
+
+  test('an outsider cannot spend the transcription quota', async () => {
+    // Evaluating a watch is free and has always run for anyone in the
+    // channel. Transcribing is a paid vendor call, so it needs the gate the
+    // free operation never did — otherwise any member of an invited channel
+    // could drop a hundred voice notes and bill them to the operator.
+    (session.transcribeForWatch as any).mockResolvedValue('should never be reached');
+    const outsider: PlatformUser = { id: 'u9', username: 'random-person', displayName: 'Nope' };
+
+    await handleMessage(client, session, voiceNote, outsider, options);
+
+    expect(session.transcribeForWatch).not.toHaveBeenCalled();
+    // The watch still sees the post, exactly as it did before this change.
+    expect(session.evaluateWatches).toHaveBeenCalledTimes(1);
+  });
+
+  test('a caption and its transcript both reach the evaluator', async () => {
+    // Someone can type and speak in one message; a watch must see both, or
+    // whichever half it was not watching for silently stops mattering.
+    (session.transcribeForWatch as any).mockResolvedValue('and restart the node');
+
+    await handleMessage(
+      client,
+      session,
+      { ...voiceNote, message: 'as discussed' } as PlatformPost,
+      user,
+      options,
+    );
+
+    const evaluated = (session.evaluateWatches as any).mock.calls[0][3];
+    expect(evaluated).toContain('as discussed');
+    expect(evaluated).toContain('and restart the node');
+  });
+});
+
 describe('handleMessage - watch evaluation hook', () => {
   let client: PlatformClient & { posts: Map<string, string> };
   let session: ReturnType<typeof createMockSessionManager>;
@@ -2773,6 +2859,14 @@ describe('isClaudeThreadsStatusPost (#491)', () => {
     ['⚠️ *Too busy* - 5 sessions active. Please try again later.'],
     ['⏱️ **Session timed out** after 30 minutes of inactivity'],
     ['⏱️ *Session idle* - will timeout in ~5 minutes without activity'],
+    // #548 variants: a stalled or decision-blocked turn reports differently
+    // from a genuinely idle one, and every variant must stay invisible.
+    ['⏱️ **Session stopped responding** - no output for 31 minutes while a turn was still running'],
+    ['⏱️ *Session stopped responding* - no output for 31 minutes while a turn was still running'],
+    ['⏱️ **Session still waiting** for a reply - no answer for 31 minutes, so the turn was stopped'],
+    ['⏱️ **No output for a while** - a turn is still running; will stop in ~4 minutes if nothing arrives'],
+    ['⏱️ *No output for a while* - a turn is still running; will stop in ~4 minutes if nothing arrives'],
+    ['⏱️ **Session still waiting** for a reply - will stop in ~4 minutes without one'],
     ['🛑 **Session cancelled** by @someone'],
     ['🔴 **EMERGENCY SHUTDOWN** initiated by @someone - killing 2 active sessions'],
     ['🔄 **Session resumed** by @someone'],
@@ -2787,6 +2881,13 @@ describe('isClaudeThreadsStatusPost (#491)', () => {
     ['🛑 stop the presses, but read this first'],
     ['is not authorized to resume this session'],
     ['something ⚠️ @bot is not authorized'],
+    // #548: the new status phrases are far more natural as human sentences
+    // than "Session timed out" ever was, so each pattern is anchored on the
+    // clause that follows, not just the opening words.
+    ['⏱️ No output for a while — is the build stuck?'],
+    ['⏱️ **No output for a while** anyone know why?'],
+    ['⏱️ Session still waiting? seems wrong'],
+    ['⏱️ Session stopped responding, should I kill it?'],
   ])('lets ordinary messages through: %s', (message) => {
     expect(isClaudeThreadsStatusPost(message)).toBe(false);
   });

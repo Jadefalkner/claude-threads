@@ -55,7 +55,13 @@ const STATUS_POST_PATTERNS: RegExp[] = [
   // raw <@U…> token depending on platform and version.
   /^⚠️\s+\S+ is not authorized\b/u,
   new RegExp(`^⚠️\\s+${BOLD}Too busy${BOLD} -`, 'u'),
+  // Keep in sync with cleanupIdleSessions in src/session/lifecycle.ts: a
+  // stalled or decision-blocked turn reports differently from a genuinely
+  // idle one (#548), and every variant must stay invisible to other bots.
   new RegExp(`^⏱️\\s+${BOLD}Session (?:timed out|idle)${BOLD}`, 'u'),
+  new RegExp(`^⏱️\\s+${BOLD}Session stopped responding${BOLD} - no output for `, 'u'),
+  new RegExp(`^⏱️\\s+${BOLD}Session still waiting${BOLD} for a reply - `, 'u'),
+  new RegExp(`^⏱️\\s+${BOLD}No output for a while${BOLD} - a turn is still running;`, 'u'),
   new RegExp(`^🛑\\s+${BOLD}Session cancelled${BOLD}`, 'u'),
   new RegExp(`^🔴\\s+${BOLD}EMERGENCY SHUTDOWN${BOLD}`, 'u'),
   new RegExp(`^🔄\\s+${BOLD}Session resumed${BOLD}`, 'u'),
@@ -496,7 +502,24 @@ export async function handleMessage(
       // session fired on the message's REAL thread root would be unreachable
       // — replies and !stop in its thread would never route to it.
       if (!dcm.enabled) {
-        session.evaluateWatches(platformId, post, username, message);
+        // A voice note reaches here as an empty string with a file beside it.
+        // Transcribe first, so a watch on "deploy" fires when someone SAYS
+        // deploy — the transcript is user input like any typed message and
+        // goes through the same path, rather than around it. Returns '' fast
+        // unless this platform has watches and transcription enabled and the
+        // post actually carries audio.
+        // ⚠️ Allowlist FIRST, and this gate is about money rather than
+        // secrecy. Evaluating a watch is free, so the line below has always
+        // run for anyone in the channel; transcribing is a paid call to an
+        // external vendor. Without this, any member of an invited channel —
+        // allowlisted or not — could drop a hundred voice notes and spend the
+        // operator's transcription quota. Their typed messages still reach
+        // the evaluator exactly as before; only the vendor call is withheld.
+        const spoken = client.isUserAllowed(username)
+          ? await session.transcribeForWatch(platformId, post)
+          : '';
+        const evaluated = spoken ? [message, spoken].filter(Boolean).join('\n') : message;
+        session.evaluateWatches(platformId, post, username, evaluated);
       }
       return;
     }

@@ -51,7 +51,9 @@ import {
   cleanupSessionUploads,
   getSessionUploadDir,
   postSkippedFilesFeedback,
+  postTranscriptFeedback,
 } from '../operations/streaming/handler.js';
+import { takeContextPromptFiles } from '../operations/context-prompt/handler.js';
 import { detectWorktreeInfo } from '../git/worktree.js';
 import { resolveSessionMemory, activeWorktreeRepoRoot } from '../memory/store.js';
 import { scheduleDistillation } from '../memory/distiller.js';
@@ -661,17 +663,32 @@ function createMessageManager(
     // Inject metadata reminder periodically
     messageToSend = maybeInjectMetadataReminder(messageToSend, session, ctx, session);
 
-    // Build content with files (if any)
-    // Note: queuedFiles from MessageManager are simplified refs (id, name)
-    // For now, send without files - the full PlatformFile[] would need to be
-    // stored separately if file support is needed here
+    // Build content with the files that were queued behind the prompt. The
+    // event only carries simplified refs (id, name) from MessageManager; the
+    // original PlatformFile[] were parked in the context-prompt module when
+    // the prompt was posted. Before this, attachments on a mid-thread start
+    // survived only because the pre-built file header rode along in
+    // queuedPrompt — startSession now queues the raw prompt, so the files
+    // have to travel here explicitly.
+    const queuedFiles = takeContextPromptFiles(session);
     const uploadDir = getSessionUploadDir(session.platformId, session.threadId);
-    const { content } = await ctx.ops.buildMessageContent(messageToSend, session.platform, uploadDir, undefined);
 
-    // Send the message to Claude
-    if (session.claude.isRunning()) {
-      session.claude.sendMessage(content);
-      ctx.ops.startTyping(session);
+    // This listener runs on a plain EventEmitter: a rejection here is nobody's
+    // to await and would surface as an unhandled rejection after the prompt
+    // state and the parked files are already consumed. Report it in the
+    // thread instead — the failure stays visible, the daemon stays up.
+    try {
+      const { content, skipped, transcripts } = await ctx.ops.buildMessageContent(messageToSend, session.platform, uploadDir, queuedFiles);
+
+      // Send the message to Claude
+      if (session.claude.isRunning()) {
+        session.claude.sendMessage(content);
+        ctx.ops.startTyping(session);
+      }
+      await postSkippedFilesFeedback(session.platform, session.threadId, skipped);
+      await postTranscriptFeedback(session.platform, session.threadId, transcripts);
+    } catch (err) {
+      await logAndNotify(err, { action: 'Send queued message after context prompt', session });
     }
 
     // Update activity and persist
@@ -1240,11 +1257,6 @@ async function startSessionImpl(
     ctx.ops.registerWorktreeUser(session.worktreeInfo.worktreePath, session.sessionId);
   }
 
-  // Build message content
-  const uploadDir = getSessionUploadDir(session.platformId, session.threadId);
-  const { content, skipped } = await ctx.ops.buildMessageContent(options.prompt, session.platform, uploadDir, options.files);
-  const messageText = content;
-
   // Check if this is a mid-thread start (replyToPostId means we're replying in an existing thread)
   // Offer context prompt if there are previous messages in the thread.
   // Use triggeringPostId (the actual @mention message) to exclude from
@@ -1270,13 +1282,21 @@ async function startSessionImpl(
     // event the session must see — excluding the thread root here previously
     // fired "triage the incident" sessions that never saw the incident.
     const excludePostId = options.autoIncludeContext ? undefined : (triggeringPostId || replyToPostId);
-    await ctx.ops.offerContextPrompt(session, messageText, options.files, excludePostId, username, options.autoIncludeContext);
-    // Either path inside offerContextPrompt sends or queues. Surface any
-    // skipped-file warnings and return — the fallback claude.sendMessage()
-    // below would be a duplicate.
-    await postSkippedFilesFeedback(session.platform, actualThreadId, skipped);
+    // Hand over the RAW prompt and files: every send path inside
+    // offerContextPrompt builds the message content itself (sendWithContext →
+    // buildMessageContent) and posts its own skipped-file / transcript
+    // feedback. Building here as well used to download every attachment
+    // twice and prepend the file-list header twice — and would transcribe a
+    // voice note twice. Either path inside offerContextPrompt sends or
+    // queues, so return: the fallback claude.sendMessage() below would be a
+    // duplicate.
+    await ctx.ops.offerContextPrompt(session, options.prompt, options.files, excludePostId, username, options.autoIncludeContext);
     return;
   }
+
+  // Build message content (once — see the note above)
+  const uploadDir = getSessionUploadDir(session.platformId, session.threadId);
+  const { content, skipped, transcripts } = await ctx.ops.buildMessageContent(options.prompt, session.platform, uploadDir, options.files);
 
   // No replyToPostId — defensive path for callers that don't pass a thread
   // root. In practice handleMessage always supplies one (post.rootId ||
@@ -1286,8 +1306,9 @@ async function startSessionImpl(
   session.messageCount++;
   claude.sendMessage(formatUserTurn(content, username, shouldAttribute(session.userAttribution, session.sessionAllowedUsers.size)));
 
-  // Surface any skipped attachments to the user
+  // Surface any skipped attachments to the user, then echo voice-note transcripts
   await postSkippedFilesFeedback(session.platform, actualThreadId, skipped);
+  await postTranscriptFeedback(session.platform, actualThreadId, transcripts);
 
   // NOTE: We don't persist here. We wait for Claude to actually respond before persisting.
   // This prevents persisting sessions where Claude dies before saving its conversation,
@@ -2231,10 +2252,35 @@ export async function cleanupIdleSessions(
 
     // Check for timeout
     if (idleMs > timeoutMs) {
-      sessionLog(session).info(`⏰ Session timed out after ${Math.round(idleMs / 60000)}min idle`);
+      const waitingOnHuman =
+        session.isProcessing &&
+        (session.messageManager?.hasPendingApproval() === true ||
+          session.messageManager?.hasPendingQuestions() === true);
+      sessionLog(session).info(
+        waitingOnHuman
+          ? `⏰ Session stopped after ${Math.round(idleMs / 60000)}min waiting on a human decision`
+          : session.isProcessing
+            ? `⏰ Session stopped responding - no events for ${Math.round(idleMs / 60000)}min with a turn open`
+            : `⏰ Session timed out after ${Math.round(idleMs / 60000)}min idle`
+      );
 
       const timeoutFormatter = session.platform.getFormatter();
-      const timeoutMessage = `${timeoutFormatter.formatBold('Session timed out')} after ${Math.round(idleMs / 60000)} minutes of inactivity\n\n💡 React with 🔄 to resume, or send a new message to continue.`;
+      // A session reaped while `isProcessing` was never idle: it had an open
+      // turn. Claiming inactivity there is false and sends the user looking in
+      // the wrong place, so the cases get different text (#548). Three of them:
+      // the turn is blocked on a human decision (the bot is waiting on *them*),
+      // the turn went silent on its own (wedged CLI, dropped API connection, one
+      // long-running tool), or the session was genuinely idle between turns.
+      //
+      // The pending check covers plan approvals and questions, which the bot
+      // holds in-process. An ordinary MCP permission prompt is owned by the MCP
+      // child and is not visible here, so that case still reads as silence —
+      // see #533 for the bridge line that would close the gap.
+      const timeoutMessage = waitingOnHuman
+        ? `${timeoutFormatter.formatBold('Session still waiting')} for a reply - no answer for ${Math.round(idleMs / 60000)} minutes, so the turn was stopped\n\n💡 React with 🔄 to resume, or send a new message to continue.`
+        : session.isProcessing
+          ? `${timeoutFormatter.formatBold('Session stopped responding')} - no output for ${Math.round(idleMs / 60000)} minutes while a turn was still running\n\n💡 React with 🔄 to resume, or send a new message to continue.`
+          : `${timeoutFormatter.formatBold('Session timed out')} after ${Math.round(idleMs / 60000)} minutes of inactivity\n\n💡 React with 🔄 to resume, or send a new message to continue.`;
 
       // Update existing warning post or create a new one
       if (session.lifecyclePostId) {
@@ -2276,7 +2322,19 @@ export async function cleanupIdleSessions(
     if (idleMs > warningThresholdMs && !session.timeoutWarningPosted) {
       const remainingMins = Math.max(0, Math.round((timeoutMs - idleMs) / 60000));
       const warningFormatter = session.platform.getFormatter();
-      const warningMessage = `${warningFormatter.formatBold('Session idle')} - will timeout in ~${remainingMins} minutes without activity`;
+      // Same distinction as the timeout branch (#548): with a turn open this
+      // is not idleness, it is silence from a turn that should be producing
+      // events. Naming it that way is the difference between "you forgot
+      // about me" and "something may be wrong".
+      const warnWaiting =
+        session.isProcessing &&
+        (session.messageManager?.hasPendingApproval() === true ||
+          session.messageManager?.hasPendingQuestions() === true);
+      const warningMessage = warnWaiting
+        ? `${warningFormatter.formatBold('Session still waiting')} for a reply - will stop in ~${remainingMins} minutes without one`
+        : session.isProcessing
+          ? `${warningFormatter.formatBold('No output for a while')} - a turn is still running; will stop in ~${remainingMins} minutes if nothing arrives`
+          : `${warningFormatter.formatBold('Session idle')} - will timeout in ~${remainingMins} minutes without activity`;
 
       // Create the warning post and store its ID for later updates
       const warningPost = await withErrorHandling(
