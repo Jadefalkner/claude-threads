@@ -12,6 +12,7 @@
  */
 
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { readFileSync, unlinkSync } from 'fs';
 import { crossSpawn } from '../utils/spawn.js';
@@ -198,7 +199,7 @@ async function codexQuickQuery(options: QuickQueryOptions): Promise<QuickQueryRe
   // callers tuned for haiku (5-15 s) would time out under load.
   const timeout = Math.max(options.timeout ?? 5000, 20000);
   const startTime = Date.now();
-  const outFile = join(tmpdir(), `claude-threads-codex-qq-${process.pid}-${Date.now()}.txt`);
+  const outFile = join(tmpdir(), `claude-threads-codex-qq-${randomUUID()}.txt`); // title+tags run concurrently
   const args = ['exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-o', outFile, '--color', 'never'];
   const input = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
   log.debug(`Quick query (codex): timeout=${timeout}ms, prompt="${prompt.substring(0, 50)}..."`);
@@ -229,6 +230,9 @@ async function codexQuickQuery(options: QuickQueryOptions): Promise<QuickQueryRe
       const durationMs = Date.now() - startTime;
       if (code === 0 && response) finish({ success: true, response, durationMs });
       else finish({ success: false, error: `exit ${code}: ${stderr.trim().slice(-500)}`, durationMs });
+    });
+    proc.stdin?.on('error', (err) => {
+      log.debug(`quickQuery (codex): stdin write failed (${(err as NodeJS.ErrnoException).code ?? err.message})`);
     });
     proc.stdin?.end(input);
   });
