@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, renameSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { acquireInstanceLock } from './instance-lock.js';
@@ -39,25 +39,27 @@ describe('acquireInstanceLock', () => {
     });
   });
 
-  test('recovers from a takeover mutex abandoned by a crashed claimant', () => {
+  test('a holder displaced during the grace period loses, the replacer keeps the lock', () => {
     withHome((lock) => {
+      // Simulate a stale-lock claimant that replaces the file while we wait.
+      const replaced = `${lock}.other`;
+      const timer = setTimeout(() => {}, 0); // keep the event loop alive during the sync wait
       mkdirSync(join(lock, '..'), { recursive: true });
-      writeFileSync(lock, '999999999'); // stale lock
-      writeFileSync(`${lock}.takeover`, '999999998'); // dead claimant crashed mid-takeover
-      const release = acquireInstanceLock();
-      expect(readFileSync(lock, 'utf8')).toBe(String(process.pid));
-      expect(existsSync(`${lock}.takeover`)).toBe(false);
-      release();
-    });
-  });
-
-  test('a live claimant holding the takeover mutex blocks reclamation', () => {
-    withHome((lock) => {
-      mkdirSync(join(lock, '..'), { recursive: true });
-      writeFileSync(lock, '999999999'); // stale lock
-      writeFileSync(`${lock}.takeover`, String(process.ppid)); // live claimant mid-takeover
-      expect(() => acquireInstanceLock()).toThrow(/lost the race/);
-      expect(readFileSync(lock, 'utf8')).toBe('999999999');
+      writeFileSync(replaced, String(process.ppid));
+      // Our acquire links first, then sleeps GRACE_MS; the rename lands before it re-checks.
+      const original = Atomics.wait;
+      (Atomics as { wait: typeof Atomics.wait }).wait = ((...args: Parameters<typeof Atomics.wait>) => {
+        renameSync(replaced, lock);
+        return original(...args);
+      }) as typeof Atomics.wait;
+      try {
+        expect(() => acquireInstanceLock()).toThrow(/won the start race/);
+      } finally {
+        (Atomics as { wait: typeof Atomics.wait }).wait = original;
+        clearTimeout(timer);
+      }
+      expect(readFileSync(lock, 'utf8')).toBe(String(process.ppid));
+      expect(existsSync(`${lock}.${process.pid}`)).toBe(false);
     });
   });
 
