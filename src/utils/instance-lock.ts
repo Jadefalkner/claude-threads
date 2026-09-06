@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { stateHome } from './state-home.js';
 
@@ -37,7 +37,10 @@ export function acquireInstanceLock(): () => void {
       if (pid && isAlive(pid)) {
         throw new Error(`another claude-threads instance (pid ${pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
       }
-      reclaimStale(path, pid);
+      // No pid means the lock vanished between link and read (a holder just
+      // released): retry the link, there is nothing to reclaim. Reclaiming
+      // here would race a third process that links in the meantime.
+      if (pid !== undefined) reclaimStale(path, pid);
       sleepMs(20); // let a concurrent claimant finish its takeover before we look again
     }
     throw new Error(`could not acquire ${path}: lost the race five times`);
@@ -51,16 +54,18 @@ export function acquireInstanceLock(): () => void {
  * under the takeover mutex the lock is re-read, so a claimant that read the
  * dead pid early cannot remove the live lock a faster claimant put there.
  */
-function reclaimStale(path: string, seenPid: number | undefined): void {
+function reclaimStale(path: string, seenPid: number): void {
   const mutex = `${path}.takeover`;
   try {
     writeFileSync(mutex, String(process.pid), { flag: 'wx' });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    // Another claimant is mid-takeover; the caller retries the link. A mutex
-    // older than a few seconds is left over from a crash inside that window.
-    // ponytail: mtime heuristic, the window is microseconds; flock() if it ever matters
-    try { if (Date.now() - statSync(mutex).mtimeMs > 5000) unlinkSync(mutex); } catch { /* gone */ }
+    // Another claimant is mid-takeover; the caller retries the link. The
+    // mutex carries its owner's pid: a dead owner crashed inside the window
+    // and its mutex is removed so the next attempt can reclaim.
+    // ponytail: pid liveness only; a hung-but-alive owner blocks forever, flock() if it ever matters
+    const owner = readPid(mutex);
+    if (owner !== undefined && !isAlive(owner)) { try { unlinkSync(mutex); } catch { /* gone */ } }
     return;
   }
   try {
