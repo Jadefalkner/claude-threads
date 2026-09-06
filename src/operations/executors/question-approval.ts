@@ -194,18 +194,26 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
     this.state.pendingApproval = reserved;
 
     // Create interactive post with approval reactions
-    const post = await ctx.createInteractivePost(
-      message,
-      // ✅ only for actions — plans have no session-wide variant
-      op.approvalType === 'plan'
-        ? [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]]
-        : [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0], ALLOW_ALL_EMOJIS[0]],
-      {
-        type: 'plan_approval',
-        interactionType: 'plan_approval',
-        toolUseId: op.toolUseId,
-      }
-    );
+    let post;
+    try {
+      post = await ctx.createInteractivePost(
+        message,
+        // ✅ only for actions — plans have no session-wide variant
+        op.approvalType === 'plan'
+          ? [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]]
+          : [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0], ALLOW_ALL_EMOJIS[0]],
+        {
+          type: 'plan_approval',
+          interactionType: 'plan_approval',
+          toolUseId: op.toolUseId,
+        }
+      );
+    } catch (err) {
+      // A reservation without a post can never be answered: release it, unless
+      // a replacement already owns the slot.
+      if (this.state.pendingApproval === reserved) this.state.pendingApproval = null;
+      throw err;
+    }
 
     if (this.state.pendingApproval !== reserved) {
       ctx.logger.info(`${op.approvalType} approval ${formatShortId(op.toolUseId)} expired while its post was being created`);

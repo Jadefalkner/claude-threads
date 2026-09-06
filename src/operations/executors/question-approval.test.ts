@@ -264,6 +264,13 @@ describe('QuestionApprovalExecutor', () => {
       expect(updates.some((m) => m.includes('Question expired'))).toBe(true);
     });
 
+    it('releases the reserved slot when the approval post cannot be created', async () => {
+      const op: ApprovalOp = { type: 'approval', sessionId: 'test:session-1', timestamp: Date.now(), toolUseId: 'req-1', approvalType: 'plan' };
+      ctx.createInteractivePost = async () => { throw new Error('platform 500'); };
+      await expect(executor.execute(op, ctx)).rejects.toThrow('platform 500');
+      expect(executor.hasPendingApproval()).toBe(false);
+    });
+
     it('handles rejection response', async () => {
       const op: ApprovalOp = {
         type: 'approval',

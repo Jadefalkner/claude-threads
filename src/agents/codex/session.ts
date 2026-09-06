@@ -166,7 +166,13 @@ export class CodexSession extends EventEmitter implements AgentSession {
     this.queuedSends++;
     this.sendChain = this.sendChain.then(() => ready).then(async () => {
       if (!this.threadId) return;
-      if (epoch !== this.sendEpoch) { this.log.debug('queued message dropped: interrupted before dispatch'); return; }
+      if (epoch !== this.sendEpoch) {
+        // The chat has been "processing" since the user posted; a message
+        // that never becomes a turn must still end that state.
+        this.log.debug('queued message dropped: interrupted before dispatch');
+        this.emitEvent({ type: 'result', subtype: 'error_interrupted', is_error: false, result: '', duration_ms: 0, num_turns: 0, session_id: this.threadId });
+        return;
+      }
       const input = [
         { type: 'text', text: content, text_elements: [] },
         ...extractImagePaths(content).map((path) => ({ type: 'localImage', path })),
