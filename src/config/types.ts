@@ -240,17 +240,41 @@ export interface McpRemoteServerConfig {
 
 export type McpServerConfig = McpStdioServerConfig | McpRemoteServerConfig;
 
+/** Discriminate on the normalized `type`, not on which keys happen to exist. */
+export function isRemoteMcpServer(server: McpServerConfig): server is McpRemoteServerConfig {
+  return server.type === 'http' || server.type === 'sse';
+}
+
+const STDIO_KEYS = new Set(['type', 'command', 'args', 'env']);
+const REMOTE_KEYS = new Set(['type', 'url', 'headers']);
+
 /**
- * Normalize the per-platform `strictMcpConfig` field. Undefined/`true` →
- * the CLI only sees the servers in the bot's own `--mcp-config` blob (its
- * permission server plus `mcpServers` declared in config.yaml). `false`
- * restores the pre-#560 inheritance: the account's user-level servers and
- * claude.ai connectors, and the repo's `.mcp.json`, all load too.
+ * Normalize the per-platform `strictMcpConfig` field. Default `false`: the
+ * CLI loads the operator's own MCP sources as it always did (user-level
+ * servers, plugin servers, the repo's `.mcp.json`) on top of the bot's blob.
+ * `true` is the opt-in hardening: only the blob (the permission server plus
+ * `mcpServers`). Claude.ai connectors are governed separately, see
+ * `resolveClaudeAiConnectors`.
  */
 export function resolveStrictMcpConfig(value: unknown, fieldPath?: string): boolean {
   return resolveBooleanFeature(value, fieldPath ?? 'strictMcpConfig', {
-    default: true,
-    verb: 'inherited MCP servers stay excluded',
+    default: false,
+    verb: 'the operator\'s MCP sources stay available',
+  });
+}
+
+/**
+ * Normalize the per-platform `claudeAiConnectors` field. Default `false`:
+ * the account's claude.ai connectors (Gmail, Google Drive, Calendar, ...)
+ * are disabled for the session via `disableClaudeAiConnectors` in the
+ * inline settings, so a bot run under a personal account does not hand the
+ * channel that person's mailbox (#560). `true` lets them through, for a
+ * platform whose users may act as that account.
+ */
+export function resolveClaudeAiConnectors(value: unknown, fieldPath?: string): boolean {
+  return resolveBooleanFeature(value, fieldPath ?? 'claudeAiConnectors', {
+    default: false,
+    verb: 'claude.ai connectors stay disabled',
   });
 }
 
@@ -279,15 +303,26 @@ export function validateMcpServers(value: unknown, fieldPath: string): Record<st
     if (name === BOT_MCP_SERVER_NAME) {
       throw new Error(`Invalid ${path}: "${BOT_MCP_SERVER_NAME}" is the bot's own server and cannot be redefined`);
     }
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
-      throw new Error(`Invalid ${path}: server names may contain letters, digits, "_", "." and "-" only`);
+    // The CLI folds other characters into "_" when it builds mcp__<server>__<tool>
+    // names, so two declared servers could collide; keep to what survives as-is.
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
+      throw new Error(`Invalid ${path}: server names may contain letters, digits, "_" and "-" only`);
     }
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       throw new Error(`Invalid ${path}: expected an object`);
     }
-    const s = raw as Record<string, unknown>;
-    const type = s.type ?? (typeof s.url === 'string' && s.command === undefined ? 'http' : 'stdio');
+    // YAML leaves `args:` / `env:` with nothing after the colon as null;
+    // treat that like an absent key instead of a type error.
+    const s = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([, v]) => v !== null && v !== undefined));
+    if (typeof s.command === 'string' && typeof s.url === 'string') {
+      throw new Error(`Invalid ${path}: has both command (stdio) and url (http/sse); keep one`);
+    }
+    const type = s.type ?? (typeof s.url === 'string' ? 'http' : 'stdio');
     if (type === 'http' || type === 'sse') {
+      const unknown = Object.keys(s).filter((k) => !REMOTE_KEYS.has(k));
+      if (unknown.length > 0) {
+        throw new Error(`Invalid ${path}: unknown key(s) ${unknown.join(', ')}; a ${type} server takes type, url, headers`);
+      }
       if (typeof s.url !== 'string' || s.url.length === 0) {
         throw new Error(`Invalid ${path}: a ${type} server needs a url`);
       }
@@ -296,6 +331,10 @@ export function validateMcpServers(value: unknown, fieldPath: string): Record<st
       }
       out[name] = { type, url: s.url, ...(s.headers ? { headers: s.headers } : {}) };
     } else if (type === 'stdio') {
+      const unknown = Object.keys(s).filter((k) => !STDIO_KEYS.has(k));
+      if (unknown.length > 0) {
+        throw new Error(`Invalid ${path}: unknown key(s) ${unknown.join(', ')}; a stdio server takes type, command, args, env`);
+      }
       if (typeof s.command !== 'string' || s.command.length === 0) {
         throw new Error(`Invalid ${path}: a stdio server needs a command (or set type: http|sse with a url)`);
       }
@@ -602,12 +641,23 @@ export interface PlatformInstanceConfig {
    */
   watches?: boolean;
   /**
-   * Only let the CLI use the MCP servers the bot hands it: its own
-   * permission server plus `mcpServers` (default `true`). Without it the CLI
-   * also loads the account's user-level servers and claude.ai connectors
-   * (Gmail, Drive, ...) and the repo's `.mcp.json`, so every session in the
-   * channel got whatever the operator's account had attached (#560). Set
-   * `false` to restore that inheritance for a platform you trust with it.
+   * Let sessions use the claude.ai connectors of the account the bot runs
+   * under (Gmail, Google Drive, Calendar, ...). Default `false`: they are
+   * disabled per session, because a bot run under a personal account used
+   * to hand every session in the channel that person's mailbox (#560).
+   * `true` only for a platform whose users may act as that account. Needs a
+   * CLI that knows `disableClaudeAiConnectors`; older CLIs ignore the
+   * setting, and the session log warns when connectors show up anyway.
+   */
+  claudeAiConnectors?: boolean;
+  /**
+   * Opt-in hardening (default `false`): pass `--strict-mcp-config`, so the
+   * CLI uses only the servers in the bot's own blob (its permission server
+   * plus `mcpServers`) and ignores every other MCP source: the account's
+   * user-level servers, servers bundled with plugins, and the repo's
+   * `.mcp.json`. Off by default because those sources are what "your
+   * machine, your setup" promises; turn it on for a channel that should get
+   * exactly the declared set and nothing else.
    */
   strictMcpConfig?: boolean;
   /**

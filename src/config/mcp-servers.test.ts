@@ -5,6 +5,7 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import {
   BOT_MCP_SERVER_NAME,
+  resolveClaudeAiConnectors,
   resolveMcpServers,
   resolveStrictMcpConfig,
   validateMcpServers,
@@ -64,6 +65,20 @@ describe('validateMcpServers', () => {
     expect(() => validateMcpServers({ a: { type: 'grpc', url: 'u' } }, 'mcpServers')).toThrow(/\.type/);
   });
 
+  it('rejects unknown keys, naming them, so a typo cannot pass as an empty option', () => {
+    expect(() => validateMcpServers({ a: { command: 'x', arg: ['y'] } }, 'mcpServers')).toThrow(/unknown key\(s\) arg/);
+    expect(() => validateMcpServers({ a: { command: 'x', cwd: '/tmp' } }, 'mcpServers')).toThrow(/unknown key\(s\) cwd/);
+    expect(() => validateMcpServers({ a: { type: 'http', url: 'u', command: 'rm' } }, 'mcpServers')).toThrow(/both command/);
+    expect(() => validateMcpServers({ a: { type: 'sse', url: 'u', timeout: 5 } }, 'mcpServers')).toThrow(/unknown key\(s\) timeout/);
+  });
+
+  it('treats a YAML null (an empty "args:" or "env:" line) as an absent key', () => {
+    expect(validateMcpServers({ a: { command: 'x', args: null, env: null } }, 'mcpServers').a).toEqual({
+      type: 'stdio', command: 'x', args: [], env: {},
+    });
+    expect(validateMcpServers({ a: { type: 'http', url: 'u', headers: null } }, 'mcpServers').a).toEqual({ type: 'http', url: 'u' });
+  });
+
   it('names the offending field path', () => {
     expect(() => validateMcpServers({ a: {} }, 'platforms[mm].mcpServers')).toThrow(/platforms\[mm\]\.mcpServers\.a/);
   });
@@ -87,9 +102,9 @@ describe('resolveMcpServers', () => {
 });
 
 describe('resolveStrictMcpConfig', () => {
-  it('defaults to strict', () => {
-    expect(resolveStrictMcpConfig(undefined)).toBe(true);
-    expect(resolveStrictMcpConfig(null)).toBe(true);
+  it('is opt-in: defaults to false', () => {
+    expect(resolveStrictMcpConfig(undefined)).toBe(false);
+    expect(resolveStrictMcpConfig(null)).toBe(false);
   });
 
   it('honors an explicit boolean', () => {
@@ -97,12 +112,34 @@ describe('resolveStrictMcpConfig', () => {
     expect(resolveStrictMcpConfig(true)).toBe(true);
   });
 
-  it('warns and stays strict on garbage', () => {
+  it('warns and stays off on garbage', () => {
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      expect(resolveStrictMcpConfig('nope', 'platforms[mm].strictMcpConfig')).toBe(true);
+      expect(resolveStrictMcpConfig('nope', 'platforms[mm].strictMcpConfig')).toBe(false);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0][0])).toContain('platforms[mm].strictMcpConfig');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('resolveClaudeAiConnectors', () => {
+  it('defaults to off', () => {
+    expect(resolveClaudeAiConnectors(undefined)).toBe(false);
+    expect(resolveClaudeAiConnectors(null)).toBe(false);
+  });
+
+  it('honors an explicit boolean', () => {
+    expect(resolveClaudeAiConnectors(true)).toBe(true);
+    expect(resolveClaudeAiConnectors(false)).toBe(false);
+  });
+
+  it('warns and stays off on garbage', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveClaudeAiConnectors('yes', 'platforms[mm].claudeAiConnectors')).toBe(false);
+      expect(String(warn.mock.calls[0][0])).toContain('platforms[mm].claudeAiConnectors');
     } finally {
       warn.mockRestore();
     }

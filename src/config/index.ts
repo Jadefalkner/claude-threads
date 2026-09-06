@@ -33,6 +33,8 @@ export {
   resolveMemoryConfig,
   resolveMcpServers,
   resolveStrictMcpConfig,
+  resolveClaudeAiConnectors,
+  isRemoteMcpServer,
   validateMcpServers,
   BOT_MCP_SERVER_NAME,
   resolveRoutinesEnabled,
@@ -142,3 +144,5 @@ export interface CliArgs {
    */
   stickyMessage?: OverheadVisibility;
 }
+export { managedMcpConfigPath, managedMcpConfigPresent, MANAGED_MCP_CONFIG_PATHS } from './managed-mcp.js';
+export { resolvePlatformMcpPosture } from './mcp-posture.js';

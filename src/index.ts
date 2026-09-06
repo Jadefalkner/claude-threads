@@ -20,7 +20,8 @@ import {
   type SlackPlatformConfig,
   type PlatformInstanceConfig,
   type PermissionMode,
-  type OverheadVisibility, resolveMcpServers, resolveStrictMcpConfig
+  type OverheadVisibility,
+  resolvePlatformMcpPosture,
 } from './config/index.js';
 import type { CliArgs } from './config/index.js';
 import { runOnboarding } from './onboarding.js';
@@ -369,6 +370,21 @@ async function startWithoutDaemon() {
     throw new Error('No platforms configured. Run with --setup to configure.');
   }
 
+  // MCP posture per platform (#560), resolved here, before the UI owns the
+  // screen and before any client exists: the top-level `mcpServers` merged
+  // with the platform's own, and the two booleans. A malformed server entry
+  // is a plain startup error with the field path, like a bad
+  // --permission-mode, not a throw from inside the platform loop. Derived DM
+  // instances spread these entries, so they inherit the validated values.
+  let mcpPostureWarnings: string[] = [];
+  try {
+    mcpPostureWarnings = resolvePlatformMcpPosture(newConfig.platforms, newConfig.mcpServers).warnings;
+  } catch (err) {
+    console.error(red(`  ❌ ${err instanceof Error ? err.message : String(err)}`));
+    process.exit(1);
+  }
+  for (const w of mcpPostureWarnings) console.warn(w);
+
   const config = newConfig;
 
   // Get the first platform's effective permission mode as the default
@@ -608,6 +624,11 @@ async function startWithoutDaemon() {
       },
     },
   });
+  // Startup warnings printed before Ink took the screen are easy to miss;
+  // repeat the MCP posture ones in the log panel.
+  for (const w of mcpPostureWarnings) {
+    ui.addLog({ level: 'warn', component: 'config', message: w });
+  }
 
   // Route all logger output through the UI
   setLogHandler((level, component, message, sessionId) => {
@@ -685,22 +706,6 @@ async function startWithoutDaemon() {
       platformType: typedConfig.type as 'mattermost' | 'slack',
       enabled: isEnabled,
     });
-
-    // MCP servers this platform's sessions may use: the bot's own plus what
-    // the operator declared (top-level merged with per-platform). Resolved
-    // once here, before the client is built, so derived DM instances that
-    // spread this config inherit the validated values. A malformed entry
-    // throws: a declared server that silently vanished would be worse than
-    // a startup error.
-    platformConfig.mcpServers = resolveMcpServers(
-      config.mcpServers,
-      platformConfig.mcpServers,
-      `platforms[${platformConfig.id}].mcpServers`,
-    );
-    platformConfig.strictMcpConfig = resolveStrictMcpConfig(
-      platformConfig.strictMcpConfig,
-      `platforms[${platformConfig.id}].strictMcpConfig`,
-    );
 
     // Create platform client using factory
     const client = createPlatformClient(platformConfig);

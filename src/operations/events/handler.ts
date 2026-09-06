@@ -238,7 +238,10 @@ export function handleEventPreProcessing(
     // one visible check that strictMcpConfig / mcpServers did what they
     // meant (#560) and that a declared server came up at all.
     if (e.subtype === 'init' && Array.isArray(e.mcp_servers)) {
-      const summary = e.mcp_servers.map((s) => `${s.name ?? '?'} (${s.status ?? 'unknown'})`).join(', ') || 'none';
+      const summary = [...e.mcp_servers]
+        .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
+        .map((s) => `${s.name ?? '?'} (${s.status ?? 'unknown'})`)
+        .join(', ') || 'none';
       if (session.mcpServersSummary !== summary) {
         session.mcpServersSummary = summary;
         sessionLog(session).info(`MCP servers: ${summary}`);
@@ -246,6 +249,27 @@ export function handleEventPreProcessing(
         if (down.length > 0) {
           sessionLog(session).warn(
             `MCP servers not connected: ${down.map((s) => `${s.name ?? '?'} (${s.status ?? 'unknown'})`).join(', ')}`,
+          );
+        }
+        // The connectors are disabled through the inline settings; a CLI
+        // that predates `disableClaudeAiConnectors` ignores that silently,
+        // and this is the only place the bot can see it happened.
+        const connectors = e.mcp_servers.filter((s) => (s.name ?? '').startsWith('claude.ai '));
+        if (connectors.length > 0 && session.platform.getMcpConfig().claudeAiConnectors !== true) {
+          const names = connectors.map((s) => s.name).join(', ');
+          sessionLog(session).warn(
+            `claude.ai connectors are active although claudeAiConnectors is off: ${names}. ` +
+            `This Claude CLI ignores both disableClaudeAiConnectors and ENABLE_CLAUDEAI_MCP_SERVERS; upgrade it.`,
+          );
+          // The people this concerns read the thread, not the bot's log.
+          // Fire-and-forget: pre-processing is synchronous.
+          const f = session.platform.getFormatter();
+          void withErrorHandling(
+            () => post(session, 'warning',
+              `${f.formatBold('claude.ai connectors are active in this session')} (${names}) although ` +
+              `${f.formatCode('claudeAiConnectors')} is off for this platform. This Claude CLI version ignores the ` +
+              `switch; upgrade the CLI on the bot's machine.`),
+            { action: 'Post connector warning', session },
           );
         }
       }
