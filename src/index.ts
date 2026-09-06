@@ -36,7 +36,7 @@ import { startReactMeasureCleanup } from './utils/perf-cleanup.js';
 import { dim, red, yellow } from './utils/colors.js';
 import { validateClaudeCli, type ClaudeValidationResult } from './claude/version-check.js';
 import { setQuickQueryBackend } from './claude/quick-query.js';
-import { acquireInstanceLock } from './utils/instance-lock.js';
+import { acquireInstanceLock, LOCKED_EXIT_CODE } from './utils/instance-lock.js';
 import { validateCodexCli } from './agents/codex/version-check.js';
 import { CODEX_PROTOCOL_VERSION } from './agents/codex/app-server.js';
 import { startUI, type UIProvider } from './ui/index.js';
@@ -414,7 +414,7 @@ async function startWithoutDaemon() {
   } catch (err) {
     console.error(red(`  ❌ ${err instanceof Error ? err.message : String(err)}`));
     console.error('');
-    process.exit(1);
+    process.exit(LOCKED_EXIT_CODE); // terminal for the daemon wrapper: restarting would only collide again
   }
   process.on('exit', () => releaseInstanceLock());
 
