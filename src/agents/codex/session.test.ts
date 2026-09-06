@@ -342,6 +342,36 @@ describe('review regressions', () => {
     expect(calls[1][0]).toBe('turn/start');
   });
 
+  test('two messages before turn/started: one turn/start, the second steers the acknowledged turn', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const a = srv(agent);
+    a.ready = Promise.resolve();
+    a.threadId = 't';
+    const calls: string[] = [];
+    a.rpc.request = async (m) => { calls.push(m); return m === 'turn/start' ? { turn: { id: 'turn-9' } } : {}; };
+    agent.sendMessage('one');
+    agent.sendMessage('two');
+    await Bun.sleep(0); await Bun.sleep(0); await Bun.sleep(0);
+    expect(calls).toEqual(['turn/start', 'turn/steer']);
+  });
+
+  test('token usage: cached tokens are split out of input, missing counters become 0, no NaN', () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const events: ClaudeEvent[] = [];
+    agent.on('event', (e: ClaudeEvent) => events.push(e));
+    const a = agent as unknown as { handleNotification(m: string, p: Record<string, unknown>): void };
+    a.handleNotification('thread/tokenUsage/updated', { tokenUsage: {
+      total: { totalTokens: 1300, inputTokens: 1000, cachedInputTokens: 600, outputTokens: 300, reasoningOutputTokens: 0 },
+      last: { totalTokens: 500, inputTokens: 400, cachedInputTokens: 300, outputTokens: 100, reasoningOutputTokens: 0 },
+      modelContextWindow: 200000,
+    } });
+    a.handleNotification('turn/completed', { turn: { id: 'u', status: 'completed', error: null } });
+    const result = events.find((e) => e.type === 'result') as ClaudeEvent & { usage: Record<string, number>; modelUsage: Record<string, Record<string, number>> };
+    expect(result.usage).toEqual({ input_tokens: 100, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 300 });
+    expect(result.modelUsage.codex).toMatchObject({ inputTokens: 400, cacheReadInputTokens: 600, cacheCreationInputTokens: 0, outputTokens: 300, contextWindow: 200000 });
+    for (const v of Object.values(result.usage)) expect(Number.isNaN(v)).toBe(false);
+  });
+
   test('a steer that loses the race against turn end falls back to a new turn', async () => {
     const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
     const a = srv(agent);

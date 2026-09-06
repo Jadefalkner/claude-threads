@@ -211,6 +211,23 @@ describe('QuestionApprovalExecutor', () => {
       expect(approvalCompleted!.toolUseId).toBe('tool-123');
     });
 
+    it('closes the post when the approval was cleared while the post was being created', async () => {
+      const op: ApprovalOp = { type: 'approval', sessionId: 'test:session-1', timestamp: Date.now(), toolUseId: 'req-1', approvalType: 'action', content: 'Bash: ls' };
+      const updates: Array<[string, string]> = [];
+      const original = ctx.createInteractivePost;
+      ctx.createInteractivePost = async (...args) => {
+        // The agent's timeout fires while the platform call is in flight.
+        expect(executor.getPendingApproval()?.toolUseId).toBe('req-1');
+        executor.clearPendingApproval();
+        return original(...args);
+      };
+      ctx.platform.updatePost = async (postId: string, message: string) => { updates.push([postId, message]); };
+      await executor.execute(op, ctx);
+      expect(executor.hasPendingApproval()).toBe(false); // the expired request was not installed
+      expect(updates).toHaveLength(1);
+      expect(updates[0][1]).toContain('Action denied');
+    });
+
     it('handles rejection response', async () => {
       const op: ApprovalOp = {
         type: 'approval',

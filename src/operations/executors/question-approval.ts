@@ -186,6 +186,13 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
         ctx.formatter.formatItalic('React to respond');
     }
 
+    // Reserve the slot before the post exists: an approval that expires or is
+    // interrupted while the post is still being created clears this entry,
+    // and the check after the await then closes the fresh post instead of
+    // installing a request nobody can answer any more.
+    const reserved = { postId: '', type: op.approvalType, toolUseId: op.toolUseId };
+    this.state.pendingApproval = reserved;
+
     // Create interactive post with approval reactions
     const post = await ctx.createInteractivePost(
       message,
@@ -200,12 +207,12 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       }
     );
 
-    // Track pending approval state
-    this.state.pendingApproval = {
-      postId: post.id,
-      type: op.approvalType,
-      toolUseId: op.toolUseId,
-    };
+    if (this.state.pendingApproval !== reserved) {
+      ctx.logger.info(`${op.approvalType} approval ${formatShortId(op.toolUseId)} expired while its post was being created`);
+      await ctx.platform.updatePost(post.id, `❌ ${ctx.formatter.formatBold('Action denied')} - the request expired`);
+      return;
+    }
+    reserved.postId = post.id;
 
     ctx.logger.debug(`Created ${op.approvalType} approval post ${formatShortId(post.id)}`);
   }
