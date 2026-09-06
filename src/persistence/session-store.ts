@@ -1,3 +1,4 @@
+import type { AgentBackend } from '../agents/types.js';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { writeFileAtomic } from './atomic-file.js';
 import { homedir } from 'os';
@@ -88,6 +89,7 @@ export interface PersistedSession {
   platformId: string;            // Which platform instance (e.g., 'default', 'mattermost-main')
   threadId: string;              // Thread ID within that platform
   claudeSessionId: string;       // UUID for --session-id / --resume
+  agentBackend?: AgentBackend;   // 'claude' | 'codex'; absent on pre-backend data → claude
   startedBy: string;             // Username who started the session
   startedByDisplayName?: string; // Display name for UI
   startedAt: string;             // ISO date

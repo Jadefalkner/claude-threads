@@ -14,7 +14,7 @@
 
 import { EventEmitter } from 'events';
 import { ClaudeEvent } from '../claude/cli.js';
-import type { ClaudeCli } from '../claude/cli.js';
+import type { AgentBackend, AgentSession } from '../agents/index.js';
 import type { PlatformClient, PlatformUser, PlatformPost, PlatformFile } from '../platform/index.js';
 import { SessionStore, PersistedSession, PersistedContextPrompt } from '../persistence/session-store.js';
 import type { PersistedTrackedTask } from '../operations/task-tracker.js';
@@ -103,6 +103,7 @@ export class SessionManager extends EventEmitter {
   private respondOnlyWhenMentioned: boolean;
   /** Config default for per-message `[@username]:` attribution on new sessions. */
   private userAttribution: boolean;
+  private readonly agentBackend: AgentBackend;
   private threadLogsEnabled: boolean;
   private threadLogsRetentionDays: number;
   // Resolved limits configuration
@@ -183,7 +184,8 @@ export class SessionManager extends EventEmitter {
     limits?: LimitsConfig,
     claudeAccounts?: ClaudeAccount[],
     respondOnlyWhenMentioned = false,
-    userAttribution = true
+    userAttribution = true,
+    agentBackend: AgentBackend = 'claude'
   ) {
     super();
     this.workingDir = workingDir;
@@ -195,6 +197,7 @@ export class SessionManager extends EventEmitter {
     this.worktreeMode = worktreeMode;
     this.respondOnlyWhenMentioned = respondOnlyWhenMentioned;
     this.userAttribution = userAttribution;
+    this.agentBackend = agentBackend;
     this.threadLogsEnabled = threadLogsEnabled;
     this.threadLogsRetentionDays = threadLogsRetentionDays;
     this.limits = resolveLimits(limits);
@@ -398,6 +401,7 @@ export class SessionManager extends EventEmitter {
       workingDir: this.workingDir,
       permissionMode: this.permissionMode,
       chromeEnabled: this.chromeEnabled,
+      agentBackend: this.agentBackend,
       respondOnlyWhenMentioned: this.respondOnlyWhenMentioned,
       userAttribution: this.userAttribution,
       debug: this.debug,
@@ -675,7 +679,7 @@ export class SessionManager extends EventEmitter {
   // Exit Handling (delegates to lifecycle module)
   // ---------------------------------------------------------------------------
 
-  private async handleExit(sessionId: string, code: number, source?: ClaudeCli): Promise<void> {
+  private async handleExit(sessionId: string, code: number, source?: AgentSession): Promise<void> {
     await lifecycle.handleExit(sessionId, code, this.getContext(), source);
   }
 
@@ -823,6 +827,7 @@ export class SessionManager extends EventEmitter {
       messageCount: session.messageCount,
       resumeFailCount: session.lifecycle.resumeFailCount,
       claudeAccountId: session.claudeAccountId,
+      agentBackend: session.agentBackend,
       sessionHeaderMode: session.sessionHeaderMode,
       unattended: session.unattended,
     };
@@ -1304,6 +1309,20 @@ export class SessionManager extends EventEmitter {
   // Commands
   async cancelSession(threadId: string, username: string): Promise<void> {
     return this.withSession(threadId, (session) => commands.cancelSession(session, username, this.getContext()));
+  }
+
+  /**
+   * Let the session's backend run a `!command` natively. True when handled
+   * (reply posted); false when the backend has no implementation and the
+   * caller should fall back to the Claude slash passthrough.
+   */
+  async runBackendCommand(threadId: string, command: string, args?: string): Promise<boolean> {
+    const session = this.findSessionByThreadId(threadId);
+    if (!session?.claude.runSlashCommand) return false;
+    const reply = await session.claude.runSlashCommand(command, args);
+    if (reply === null) return false;
+    await post(session, 'info', reply);
+    return true;
   }
 
   async interruptSession(threadId: string, username: string): Promise<void> {

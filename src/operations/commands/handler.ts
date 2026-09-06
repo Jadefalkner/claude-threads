@@ -16,7 +16,7 @@ import {
 } from '../../config/index.js';
 import type { PermissionMode } from '../../config/index.js';
 import { handleRateLimit } from '../../session/lifecycle.js';
-import { ClaudeCli } from '../../claude/cli.js';
+import { createAgentSession } from '../../agents/index.js';
 import { buildRestartCliOptions } from '../../claude/restart-options.js';
 import { randomUUID } from 'crypto';
 import { resolve } from 'path';
@@ -144,7 +144,7 @@ export async function restartClaudeSession(
   }
 
   // Create new Claude CLI
-  const newClaude = new ClaudeCli(cliOptions);
+  const newClaude = createAgentSession(session.agentBackend ?? 'claude', cliOptions);
   session.claude = newClaude;
 
   // Rebind event handlers (use sessionId which is the composite key).

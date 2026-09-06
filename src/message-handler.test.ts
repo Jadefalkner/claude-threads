@@ -85,6 +85,7 @@ function createMockSessionManager() {
     hasPendingWorktreePrompt: mock(() => false),
     handleWorktreeBranchResponse: mock(async () => false),
     sendFollowUp: mock(async () => {}),
+    runBackendCommand: mock(async () => false),
     evaluateWatches: mock(() => {}),
     resumePausedSession: mock(async () => {}),
     cancelPausedSession: mock(() => {}),

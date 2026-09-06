@@ -790,7 +790,7 @@ describe('SessionManager', () => {
         'queuedPrompt', 'queuedByUsername', 'queuedFiles', 'firstPrompt', 'pendingContextPrompt',
         'needsContextPromptOnNextMessage', 'lifecyclePostId', 'isPaused', 'sessionTitle',
         'sessionDescription', 'sessionTags', 'pullRequestUrl', 'messageCount',
-        'resumeFailCount', 'claudeAccountId', 'sessionHeaderMode', 'taskTrackerState',
+        'resumeFailCount', 'claudeAccountId', 'agentBackend', 'sessionHeaderMode', 'taskTrackerState',
         'unattended',
       ]);
       expect(new Set(Object.keys(written))).toEqual(expectedKeys);

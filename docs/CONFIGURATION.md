@@ -52,6 +52,17 @@ platforms:
 | `threadLogs` | Thread logging (see below) | enabled |
 | `stickyMessage` | Sticky message text customization (see below) | none |
 | `claudeAccounts` | Multi-account pool (see below) | single-account mode |
+| `agentBackend` | Agent that runs new sessions: `claude` (Claude Code CLI) or `codex` (OpenAI Codex via `codex app-server`, see below). Existing sessions keep the backend they were started with. | `claude` |
+
+### Agent Backend (`agentBackend`)
+
+`agentBackend: codex` runs every new session on OpenAI Codex instead of the Claude Code CLI. The bot talks to `codex app-server` over stdio (JSON-RPC, one process per session), tested against Codex 0.153.4; startup checks that `codex` is installed and logged in (`codex login`) and warns on a version drift.
+
+What carries over unchanged: approvals via reactions (including "approve for the rest of this session"), questions from the agent (`item/tool/requestUserInput` is rendered like `AskUserQuestion`), `!stop`, `!cd`, `!permissions`, worktrees, file and image attachments (sent as `localImage` input), file uploads and agent actions through the bot's MCP server (Codex loads it as `claude-threads-mcp`), thread logs, audit log, memory, session resume across bot restarts (`thread/resume`). Backend-specific commands: `!compact` (`thread/compact/start`), `!model <name>`, `!effort <level>`, `!context` / `!cost` (token usage). Codex-side usage limits are reported in the thread with the reset time.
+
+Not supported with `codex`: `claudeAccounts` (Claude-only; startup refuses the combination), Claude slash-command passthrough, Claude plugins. Title and branch suggestions use `codex exec --ephemeral`. Codex additionally loads the MCP servers from its own `~/.codex/config.toml`; keep `allowedUsers` in mind when those servers reach personal data.
+
+Permission mapping: `default` → Codex `approvalPolicy: untrusted`, `sandbox: workspace-write`; `auto` → `on-request`; `bypass` → `never`, `danger-full-access`.
 
 ### Resource Limits (`limits`)
 
