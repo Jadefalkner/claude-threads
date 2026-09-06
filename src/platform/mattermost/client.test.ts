@@ -363,13 +363,17 @@ describe('heartbeat probe', () => {
       ws: unknown; HEARTBEAT_INTERVAL_MS: number; HEARTBEAT_TIMEOUT_MS: number;
       startHeartbeat(): void; stopHeartbeat(): void; scheduleReconnect(): void; updateLastMessageTime(): void;
     };
-    Object.defineProperty(c, 'HEARTBEAT_INTERVAL_MS', { value: 15 });
-    Object.defineProperty(c, 'HEARTBEAT_TIMEOUT_MS', { value: 60 });
+    // Real timers: the timeout check runs before the probe, so an event-loop
+    // stall longer than TIMEOUT between two ticks would reconnect and fail
+    // the test. 25/250/500 keeps ten times the slack of a loaded CI runner
+    // while the timeout can still trip inside the wait.
+    Object.defineProperty(c, 'HEARTBEAT_INTERVAL_MS', { value: 25 });
+    Object.defineProperty(c, 'HEARTBEAT_TIMEOUT_MS', { value: 250 });
     let reconnects = 0;
     c.scheduleReconnect = () => { reconnects++; };
     c.ws = { readyState: 1, send: (data: string) => { sent.push(data); c.updateLastMessageTime(); } };
     c.startHeartbeat();
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 500));
     c.stopHeartbeat();
     expect(sent.length).toBeGreaterThan(0);
     expect(JSON.parse(sent[0])).toMatchObject({ action: 'ping' });
