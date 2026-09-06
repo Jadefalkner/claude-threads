@@ -381,11 +381,14 @@ describe('review regressions', () => {
     a.threadId = 't';
     const calls: string[] = [];
     a.rpc.request = async (m) => { calls.push(m); return {}; };
+    const events: ClaudeEvent[] = [];
+    agent.on('event', (e: ClaudeEvent) => events.push(e));
     agent.sendMessage('hello');
     expect(agent.interrupt()).toBe(true); // something was queued
     open();
     await Bun.sleep(0); await Bun.sleep(0);
     expect(calls).toEqual([]);
+    expect(events.find((e) => e.type === 'result')).toMatchObject({ subtype: 'error_interrupted' }); // ends the chat's processing state
     agent.sendMessage('after'); // later messages are unaffected
     await Bun.sleep(0); await Bun.sleep(0);
     expect(calls).toEqual(['turn/start']);
