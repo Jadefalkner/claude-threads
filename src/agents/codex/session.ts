@@ -156,15 +156,25 @@ export class CodexSession extends EventEmitter implements AgentSession {
     if (!this.ready) throw new Error('Not started');
     void this.ready.then(async () => {
       if (!this.threadId) return;
-      await this.rpc.request('turn/start', {
-        threadId: this.threadId,
-        input: [
-          { type: 'text', text: content, text_elements: [] },
-          ...extractImagePaths(content).map((path) => ({ type: 'localImage', path })),
-        ],
-        model: this.model,
-        effort: this.effort,
-      });
+      const input = [
+        { type: 'text', text: content, text_elements: [] },
+        ...extractImagePaths(content).map((path) => ({ type: 'localImage', path })),
+      ];
+      // A message while a turn runs steers that turn (what Claude does with a
+      // mid-turn stdin line); turn/start would be rejected as "already
+      // running" and its error result would end the chat's processing state
+      // while the first turn is still going.
+      const turn = this.activeTurn;
+      if (turn) {
+        try {
+          await this.rpc.request('turn/steer', { threadId: this.threadId, input, expectedTurnId: turn.turnId });
+          return;
+        } catch (err) {
+          if (this.activeTurn) throw err;
+          this.log.debug(`turn/steer failed after the turn ended (${err}); starting a new turn`);
+        }
+      }
+      await this.rpc.request('turn/start', { threadId: this.threadId, input, model: this.model, effort: this.effort });
     }).catch((err) => {
       // The chat is in "processing" from the moment the user posted; a
       // rejected turn/start must close that state like a failed turn.
@@ -570,7 +580,8 @@ export class CodexSession extends EventEmitter implements AgentSession {
    */
   private askQuestions(p: Json): Promise<{ answers: Record<string, { answers: string[] }> }> {
     const raw = (p.questions as Array<{ id: string; header: string; question: string; options: Array<{ label: string; description: string }> | null }>) ?? [];
-    if (this.pendingQuestion) this.closeOpenPrompts('question replaced');
+    // Only the superseded question set closes; approvals of this turn stay open.
+    this.closePendingQuestion();
     return new Promise((resolve) => {
       const timeoutMs = (p.autoResolutionMs as number | null) ?? this.options.permissionTimeoutMs ?? 120000;
       const setId = `q-${randomUUID()}`;
@@ -613,12 +624,15 @@ export class CodexSession extends EventEmitter implements AgentSession {
       resolve('decline');
     }
     this.pendingApprovals.clear();
-    const question = this.pendingQuestion;
-    if (question) {
-      this.pendingQuestion = null;
-      this.emitEvent({ type: 'question_timeout', request_id: question.id, session_id: this.threadId });
-      question.resolve({});
-    }
+    this.closePendingQuestion();
     if (open) this.log.debug(`${open} open prompt(s) closed: ${reason}`);
+  }
+
+  private closePendingQuestion(): void {
+    const question = this.pendingQuestion;
+    if (!question) return;
+    this.pendingQuestion = null;
+    this.emitEvent({ type: 'question_timeout', request_id: question.id, session_id: this.threadId });
+    question.resolve({});
   }
 }

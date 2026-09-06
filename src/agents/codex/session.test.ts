@@ -325,6 +325,62 @@ describe('review regressions', () => {
     expect(await second).toEqual({ answers: { new: { answers: ['yes'] } } });
   });
 
+  test('a message during a running turn steers it; after the turn it starts a new one', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const a = srv(agent);
+    a.ready = Promise.resolve();
+    a.threadId = 't';
+    const calls: Array<[string, unknown]> = [];
+    a.rpc.request = async (m, p) => { calls.push([m, p]); return {}; };
+    a.activeTurn = { threadId: 't', turnId: 'turn-1' };
+    agent.sendMessage('also check the tests');
+    await Bun.sleep(0);
+    expect(calls).toEqual([['turn/steer', { threadId: 't', input: [{ type: 'text', text: 'also check the tests', text_elements: [] }], expectedTurnId: 'turn-1' }]]);
+    a.activeTurn = null;
+    agent.sendMessage('next');
+    await Bun.sleep(0);
+    expect(calls[1][0]).toBe('turn/start');
+  });
+
+  test('a steer that loses the race against turn end falls back to a new turn', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const a = srv(agent);
+    a.ready = Promise.resolve();
+    a.threadId = 't';
+    const calls: string[] = [];
+    a.rpc.request = async (m) => {
+      calls.push(m);
+      if (m === 'turn/steer') { a.activeTurn = null; throw new Error('no active turn'); }
+      return {};
+    };
+    a.activeTurn = { threadId: 't', turnId: 'turn-1' };
+    agent.sendMessage('hi');
+    await Bun.sleep(0);
+    expect(calls).toEqual(['turn/steer', 'turn/start']);
+  });
+
+  test('a replaced question set leaves approvals of the same turn open', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const events: ClaudeEvent[] = [];
+    agent.on('event', (e: ClaudeEvent) => events.push(e));
+    const a = srv(agent);
+    a.activeTurn = { threadId: 't', turnId: 'u' };
+    const approval = a.handleServerRequest('item/commandExecution/requestApproval', { command: 'ls' });
+    const q = (id: string) => a.handleServerRequest('item/tool/requestUserInput', {
+      questions: [{ id, header: 'H', question: id, isOther: false, isSecret: false, options: [{ label: 'y', description: '' }] }],
+      isBlocking: true, autoResolutionMs: null,
+    });
+    const first = q('one');
+    await Bun.sleep(0);
+    void q('two');
+    expect(await first).toEqual({ answers: {} }); // superseded
+    await Bun.sleep(0);
+    const request = events.find((e) => e.type === 'approval_request');
+    expect(events.find((e) => e.type === 'approval_timeout')).toBeUndefined(); // approval still open
+    agent.respondToApproval(String(request?.request_id), true);
+    expect(await approval).toEqual({ decision: 'accept' });
+  });
+
   test('image paths with spaces are extracted', () => {
     expect(extractImagePaths('[Attached files from chat — saved to disk, use Read or move/copy as needed:]\n- /tmp/up/Screenshot 2026-09-06 (1).png (image/png, 12 KB)\n\nhi'))
       .toEqual(['/tmp/up/Screenshot 2026-09-06 (1).png']);
