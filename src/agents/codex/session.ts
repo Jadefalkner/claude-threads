@@ -92,6 +92,10 @@ export class CodexSession extends EventEmitter implements AgentSession {
   private turnText = '';
   private turnStartedAt = 0;
   private status: StatusLineData | null = null;
+  /** Cumulative counters from thread/tokenUsage/updated, normalised to Claude's split (input excludes cached). */
+  private totals: { input: number; cachedInput: number; cacheWrite: number; output: number } | null = null;
+  /** Sends run one after another: two messages before turn/started must not both issue turn/start. */
+  private sendChain: Promise<void> = Promise.resolve();
   private permanentFailure: string | null = null;
   private pendingApprovals = new Map<string, (d: ApprovalDecision) => void>();
   // ponytail: one approval prompt at a time — the approval executor holds a
@@ -154,7 +158,8 @@ export class CodexSession extends EventEmitter implements AgentSession {
 
   sendMessage(content: string): void {
     if (!this.ready) throw new Error('Not started');
-    void this.ready.then(async () => {
+    const ready = this.ready;
+    this.sendChain = this.sendChain.then(() => ready).then(async () => {
       if (!this.threadId) return;
       const input = [
         { type: 'text', text: content, text_elements: [] },
@@ -174,7 +179,10 @@ export class CodexSession extends EventEmitter implements AgentSession {
           this.log.debug(`turn/steer failed after the turn ended (${err}); starting a new turn`);
         }
       }
-      await this.rpc.request('turn/start', { threadId: this.threadId, input, model: this.model, effort: this.effort });
+      const r = await this.rpc.request<{ turn?: { id?: string } }>('turn/start', { threadId: this.threadId, input, model: this.model, effort: this.effort });
+      // The response acknowledges the turn before turn/started arrives; the
+      // next queued message must already see it as active (→ steer).
+      if (!this.activeTurn && r?.turn?.id) this.activeTurn = { threadId: this.threadId, turnId: String(r.turn.id) };
     }).catch((err) => {
       // The chat is in "processing" from the moment the user posted; a
       // rejected turn/start must close that state like a failed turn.
@@ -334,15 +342,15 @@ export class CodexSession extends EventEmitter implements AgentSession {
           session_id: this.threadId,
           // Same shape the Claude CLI puts on its result: this is what fills
           // the session header (model, context %). Codex reports no cost.
-          ...(this.status ? {
+          ...(this.status && this.totals ? {
             total_cost_usd: 0,
             usage: this.status.current_usage,
             modelUsage: {
               [this.model]: {
-                inputTokens: this.status.total_input_tokens,
-                outputTokens: this.status.total_output_tokens,
-                cacheReadInputTokens: this.status.current_usage?.cache_read_input_tokens ?? 0,
-                cacheCreationInputTokens: this.status.current_usage?.cache_creation_input_tokens ?? 0,
+                inputTokens: this.totals.input,
+                outputTokens: this.totals.output,
+                cacheReadInputTokens: this.totals.cachedInput,
+                cacheCreationInputTokens: this.totals.cacheWrite,
                 contextWindow: this.status.context_window_size,
                 costUSD: 0,
               },
@@ -352,18 +360,26 @@ export class CodexSession extends EventEmitter implements AgentSession {
         return;
       }
       case 'thread/tokenUsage/updated': {
+        // Codex counts cached tokens inside inputTokens; Claude's consumers add
+        // input + cache_read themselves, so split them here. Fields may be
+        // absent on older servers — never let undefined reach the arithmetic.
         const usage = p.tokenUsage as { total: Json; last: Json; modelContextWindow: number | null };
-        const total = usage.total as Record<string, number>;
-        const last = usage.last as Record<string, number>;
+        const norm = (u: Record<string, number | undefined>) => {
+          const cached = u.cachedInputTokens ?? 0;
+          return { input: Math.max(0, (u.inputTokens ?? 0) - cached), cachedInput: cached, cacheWrite: u.cacheWriteInputTokens ?? 0, output: u.outputTokens ?? 0 };
+        };
+        const total = norm(usage.total as Record<string, number | undefined>);
+        const last = norm(usage.last as Record<string, number | undefined>);
+        this.totals = total;
         this.status = {
           context_window_size: usage.modelContextWindow ?? 0,
-          total_input_tokens: total.inputTokens,
-          total_output_tokens: total.outputTokens,
+          total_input_tokens: total.input,
+          total_output_tokens: total.output,
           current_usage: {
-            input_tokens: last.inputTokens,
-            output_tokens: last.outputTokens,
-            cache_creation_input_tokens: last.cacheWriteInputTokens,
-            cache_read_input_tokens: last.cachedInputTokens,
+            input_tokens: last.input,
+            output_tokens: last.output,
+            cache_creation_input_tokens: last.cacheWrite,
+            cache_read_input_tokens: last.cachedInput,
           },
           model: { id: this.model, display_name: this.model },
           cost: null,
@@ -565,8 +581,9 @@ export class CodexSession extends EventEmitter implements AgentSession {
       case 'cost': {
         const s = this.status;
         if (!s) return 'No usage data yet.';
-        const pct = s.context_window_size ? Math.round(100 * (s.current_usage?.input_tokens ?? 0) / s.context_window_size) : 0;
-        return `Context: ${s.current_usage?.input_tokens ?? 0}/${s.context_window_size} tokens (${pct}%) · total in ${s.total_input_tokens}, out ${s.total_output_tokens} · model ${s.model?.id}`;
+        const inContext = (s.current_usage?.input_tokens ?? 0) + (s.current_usage?.cache_read_input_tokens ?? 0);
+        const pct = s.context_window_size ? Math.round(100 * inContext / s.context_window_size) : 0;
+        return `Context: ${inContext}/${s.context_window_size} tokens (${pct}%) · total in ${s.total_input_tokens}, out ${s.total_output_tokens} · model ${s.model?.id}`;
       }
       default:
         return null;

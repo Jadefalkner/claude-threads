@@ -194,7 +194,9 @@ export function handleEventPreProcessing(
       // moment this one expires, and its prompt is skipped while a pending
       // approval is still set. The post itself is closed asynchronously.
       session.messageManager.clearPendingApproval();
-      void updatePost(session, pending.postId, `❌ ${session.platform.getFormatter().formatBold('Action denied')} - the request expired`);
+      // An empty postId is a slot reserved while the post is still being
+      // created; the executor closes that post itself once it exists.
+      if (pending.postId) void updatePost(session, pending.postId, `❌ ${session.platform.getFormatter().formatBold('Action denied')} - the request expired`);
     }
   }
 
