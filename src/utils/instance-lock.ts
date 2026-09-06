@@ -1,6 +1,9 @@
 import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { stateHome } from './state-home.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('lock');
 
 /** Exit status for "another instance holds this state directory": the daemon wrapper never restarts on it. */
 export const LOCKED_EXIT_CODE = 3;
@@ -23,17 +26,30 @@ export const LOCKED_EXIT_CODE = 3;
  */
 export function acquireInstanceLock(): () => void {
   const path = join(stateHome(), '.config', 'claude-threads', 'instance.lock');
-  mkdirSync(dirname(path), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}`;
   writeFileSync(tmp, String(process.pid));
   try {
     for (let attempt = 0; attempt < 5; attempt++) {
-      if (tryLink(tmp, path)) return () => release(path);
+      let linked: boolean;
+      try {
+        linked = tryLink(tmp, path);
+      } catch (err) {
+        // No hard links on this filesystem (SMB/CIFS without unix extensions,
+        // exFAT, FUSE mounts): the default install must keep starting. Only a
+        // deliberate second instance loses protection here.
+        log.warn(`instance lock unavailable on this filesystem (${(err as NodeJS.ErrnoException).code ?? String(err)}); running without it`);
+        return () => {};
+      }
+      if (linked) return () => release(path);
       const seen = inspect(path);
       if (!seen) continue; // vanished between link and read (holder released): retry the link
       if (seen.pid === process.pid) return () => release(path);
       if (seen.pid && isAlive(seen.pid)) {
-        throw new Error(`another claude-threads instance (pid ${seen.pid}) already uses ${dirname(path)} — set CLAUDE_THREADS_HOME to run a second bot`);
+        throw new Error(
+          `another claude-threads instance (pid ${seen.pid}) already uses ${dirname(path)} — ` +
+          `set CLAUDE_THREADS_HOME to run a second bot; if pid ${seen.pid} is not a claude-threads process, delete ${path}`,
+        );
       }
       // Dead holder: move exactly that inode aside; rename() hands it to one claimant only.
       const aside = `${path}.stale.${process.pid}`;
@@ -41,8 +57,8 @@ export function acquireInstanceLock(): () => void {
       if (statSync(aside).ino !== seen.ino) {
         // We moved a lock that was linked after our inspection; its holder is
         // alive. link() never overwrites, so a lock that landed meanwhile stays.
-        // ponytail: if one did land in that gap, the displaced holder runs on
-        // unlocked — the last window only flock() closes, and Node 20 has none
+        // TODO: if one did land in that gap, the displaced holder runs on
+        // unlocked — the last window only flock() closes, and Node 20 has none.
         tryLink(aside, path);
         unlinkSync(aside);
         continue;

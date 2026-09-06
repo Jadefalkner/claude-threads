@@ -13,7 +13,7 @@ export function stateHome(): string {
   return resolve(process.env.CLAUDE_THREADS_HOME || homedir());
 }
 
-/** True when the state root was overridden (a second instance, not the default one). */
+/** True when the state root differs from the default one (a second instance). An explicit `CLAUDE_THREADS_HOME=$HOME` is not an override. */
 export function hasStateHomeOverride(): boolean {
-  return Boolean(process.env.CLAUDE_THREADS_HOME);
+  return stateHome() !== resolve(homedir());
 }
