@@ -96,6 +96,9 @@ export class CodexSession extends EventEmitter implements AgentSession {
   private totals: { input: number; cachedInput: number; cacheWrite: number; output: number } | null = null;
   /** Sends run one after another: two messages before turn/started must not both issue turn/start. */
   private sendChain: Promise<void> = Promise.resolve();
+  private queuedSends = 0;
+  /** Bumped by interrupt(): sends queued before it are dropped, a turn/start still in flight is interrupted on arrival. */
+  private sendEpoch = 0;
   private permanentFailure: string | null = null;
   private pendingApprovals = new Map<string, (d: ApprovalDecision) => void>();
   // ponytail: one approval prompt at a time — the approval executor holds a
@@ -159,8 +162,11 @@ export class CodexSession extends EventEmitter implements AgentSession {
   sendMessage(content: string): void {
     if (!this.ready) throw new Error('Not started');
     const ready = this.ready;
+    const epoch = this.sendEpoch;
+    this.queuedSends++;
     this.sendChain = this.sendChain.then(() => ready).then(async () => {
       if (!this.threadId) return;
+      if (epoch !== this.sendEpoch) { this.log.debug('queued message dropped: interrupted before dispatch'); return; }
       const input = [
         { type: 'text', text: content, text_elements: [] },
         ...extractImagePaths(content).map((path) => ({ type: 'localImage', path })),
@@ -183,7 +189,10 @@ export class CodexSession extends EventEmitter implements AgentSession {
       // The response acknowledges the turn before turn/started arrives; the
       // next queued message must already see it as active (→ steer).
       if (!this.activeTurn && r?.turn?.id) this.activeTurn = { threadId: this.threadId, turnId: String(r.turn.id) };
-    }).catch((err) => {
+      // An interrupt that arrived while the ack was pending had no turn id to
+      // target; it applies to this turn now that there is one.
+      if (epoch !== this.sendEpoch && this.activeTurn) this.interrupt();
+    }).finally(() => { this.queuedSends--; }).catch((err) => {
       // The chat is in "processing" from the moment the user posted; a
       // rejected turn/start must close that state like a failed turn.
       this.log.error(`turn/start failed: ${err}`);
@@ -196,7 +205,14 @@ export class CodexSession extends EventEmitter implements AgentSession {
 
   interrupt(): boolean {
     const turn = this.activeTurn;
-    if (!turn) return false;
+    // Queued messages (steers, or the first message while the thread is still
+    // opening) belong to the work being interrupted: drop them.
+    this.sendEpoch++;
+    if (!turn) {
+      if (this.queuedSends === 0) return false;
+      this.closeOpenPrompts('interrupt');
+      return true;
+    }
     // Nothing waits for a decision on an aborted turn: close open prompts now
     // (their posts resolve as denied via approval_timeout) instead of after
     // the permission timeout.
@@ -373,7 +389,10 @@ export class CodexSession extends EventEmitter implements AgentSession {
         this.totals = total;
         this.status = {
           context_window_size: usage.modelContextWindow ?? 0,
-          total_input_tokens: total.input,
+          // The status-line consumer reads total_input_tokens as "tokens in the
+          // current context", so this is the last request's input incl. cache,
+          // not the thread's cumulative input (that lives in `totals`).
+          total_input_tokens: last.input + last.cachedInput,
           total_output_tokens: total.output,
           current_usage: {
             input_tokens: last.input,
@@ -583,7 +602,7 @@ export class CodexSession extends EventEmitter implements AgentSession {
         if (!s) return 'No usage data yet.';
         const inContext = (s.current_usage?.input_tokens ?? 0) + (s.current_usage?.cache_read_input_tokens ?? 0);
         const pct = s.context_window_size ? Math.round(100 * inContext / s.context_window_size) : 0;
-        return `Context: ${inContext}/${s.context_window_size} tokens (${pct}%) · total in ${s.total_input_tokens}, out ${s.total_output_tokens} · model ${s.model?.id}`;
+        return `Context: ${inContext}/${s.context_window_size} tokens (${pct}%) · total in ${this.totals?.input ?? 0} (+${this.totals?.cachedInput ?? 0} cached), out ${s.total_output_tokens} · model ${s.model?.id}`;
       }
       default:
         return null;

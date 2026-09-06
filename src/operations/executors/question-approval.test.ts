@@ -228,6 +228,42 @@ describe('QuestionApprovalExecutor', () => {
       expect(updates[0][1]).toContain('Action denied');
     });
 
+    it('a reaction whose approval expired mid-update does not release a replacement approval', async () => {
+      const first: ApprovalOp = { type: 'approval', sessionId: 'test:session-1', timestamp: Date.now(), toolUseId: 'req-1', approvalType: 'action', content: 'a' };
+      await executor.execute(first, ctx);
+      const postId = executor.getPendingApproval()!.postId;
+      let release!: () => void;
+      ctx.platform.updatePost = (id: string) => new Promise((r) => { release = () => r({ id } as PlatformPost); });
+      const reaction = executor.handleApprovalResponse(postId, true, ctx);
+      // The agent's timeout fires while the post update is in flight, and the
+      // next queued approval takes the slot.
+      executor.clearPendingApproval();
+      ctx.platform.updatePost = async (id: string) => ({ id } as PlatformPost);
+      const second: ApprovalOp = { ...first, toolUseId: 'req-2', content: 'b' };
+      await executor.execute(second, ctx);
+      expect(executor.getPendingApproval()?.toolUseId).toBe('req-2');
+      release();
+      await reaction;
+      expect(executor.getPendingApproval()?.toolUseId).toBe('req-2'); // survived the stale clear
+    });
+
+    it('a question set replaced while its post is being created does not adopt that post', async () => {
+      const op: QuestionOp = {
+        type: 'question', sessionId: 'test:session-1', timestamp: Date.now(), toolUseId: 'q-1', currentIndex: 0,
+        questions: [{ header: 'H', question: 'one?', options: [{ label: 'a', description: '' }], multiSelect: false }],
+      };
+      const updates: string[] = [];
+      const original = ctx.createInteractivePost;
+      ctx.createInteractivePost = async (...args) => {
+        executor.clearPendingQuestionSet(); // expired while the platform call is in flight
+        return original(...args);
+      };
+      ctx.platform.updatePost = async (id: string, message: string) => { updates.push(message); return { id } as PlatformPost; };
+      await executor.execute(op, ctx);
+      expect(executor.getPendingQuestionSet()).toBeNull();
+      expect(updates.some((m) => m.includes('Question expired'))).toBe(true);
+    });
+
     it('handles rejection response', async () => {
       const op: ApprovalOp = {
         type: 'approval',

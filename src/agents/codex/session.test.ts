@@ -369,7 +369,43 @@ describe('review regressions', () => {
     const result = events.find((e) => e.type === 'result') as ClaudeEvent & { usage: Record<string, number>; modelUsage: Record<string, Record<string, number>> };
     expect(result.usage).toEqual({ input_tokens: 100, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 300 });
     expect(result.modelUsage.codex).toMatchObject({ inputTokens: 400, cacheReadInputTokens: 600, cacheCreationInputTokens: 0, outputTokens: 300, contextWindow: 200000 });
+    expect(agent.getStatusData()?.total_input_tokens).toBe(400); // current context = last input incl. cache, for the status-line consumer
     for (const v of Object.values(result.usage)) expect(Number.isNaN(v)).toBe(false);
+  });
+
+  test('interrupt before the thread is open drops the queued first message', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const a = srv(agent);
+    let open!: () => void;
+    a.ready = new Promise<void>((r) => { open = r; });
+    a.threadId = 't';
+    const calls: string[] = [];
+    a.rpc.request = async (m) => { calls.push(m); return {}; };
+    agent.sendMessage('hello');
+    expect(agent.interrupt()).toBe(true); // something was queued
+    open();
+    await Bun.sleep(0); await Bun.sleep(0);
+    expect(calls).toEqual([]);
+    agent.sendMessage('after'); // later messages are unaffected
+    await Bun.sleep(0); await Bun.sleep(0);
+    expect(calls).toEqual(['turn/start']);
+  });
+
+  test('interrupt while turn/start awaits its ack interrupts that turn once the id arrives', async () => {
+    const agent = new CodexSession({ workingDir: '/tmp', memory: null, agentFeatures: null });
+    const a = srv(agent);
+    a.ready = Promise.resolve();
+    a.threadId = 't';
+    const calls: Array<[string, unknown]> = [];
+    let ack!: (v: unknown) => void;
+    a.rpc.request = (m, p) => { calls.push([m, p]); return m === 'turn/start' ? new Promise((r) => { ack = r; }) : Promise.resolve({}); };
+    agent.sendMessage('go');
+    await Bun.sleep(0); await Bun.sleep(0);
+    expect(agent.interrupt()).toBe(true);
+    ack({ turn: { id: 'turn-7' } });
+    await Bun.sleep(0); await Bun.sleep(0);
+    expect(calls.map((c) => c[0])).toEqual(['turn/start', 'turn/interrupt']);
+    expect(calls[1][1]).toMatchObject({ turnId: 'turn-7' });
   });
 
   test('a steer that loses the race against turn end falls back to a new turn', async () => {
