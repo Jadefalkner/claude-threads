@@ -16,9 +16,9 @@ import { withErrorHandling } from '../../utils/error-handler/index.js';
 import { resetSessionActivity, post, postError, updatePost } from '../post-helpers/index.js';
 import type { SessionContext } from '../session-context/index.js';
 import { createLogger } from '../../utils/logger.js';
-import { realpathSync } from 'fs';
 import { homedir } from 'os';
-import { join, sep } from 'path';
+import { validateOutboundPath } from '../../mcp/path-validator.js';
+import { join } from 'path';
 import { auditDetailForTool, auditLog, isAuditEnabled } from '../../persistence/audit-log.js';
 import { createSessionLog } from '../../utils/session-log.js';
 import { extractPullRequestUrl } from '../../utils/pr-detector.js';
@@ -28,6 +28,8 @@ import { trackEvent } from '../bug-report/index.js';
 import { parseClaudeCommand, removeCommandFromText, isClaudeAllowedCommand } from '../../commands/index.js';
 
 const log = createLogger('events');
+/** Matches the MCP server's default for send_file. */
+const DEFAULT_OUTBOUND_MAX_BYTES = 100 * 1024 * 1024;
 const sessionLog = createSessionLog(log);
 
 // ---------------------------------------------------------------------------
@@ -171,16 +173,6 @@ function isSidechainEvent(event: ClaudeEvent): boolean {
  * Pre-processing for events when using MessageManager.
  * Handles session-specific side effects that should run BEFORE the main event handling.
  */
-function isInsideDir(path: string, dir: string): boolean {
-  try {
-    const real = realpathSync(path);
-    const base = realpathSync(dir);
-    return real === base || real.startsWith(base.endsWith(sep) ? base : base + sep);
-  } catch {
-    return false;
-  }
-}
-
 export function handleEventPreProcessing(
   session: Session,
   event: ClaudeEvent,
@@ -198,7 +190,11 @@ export function handleEventPreProcessing(
     const requestId = (event as ClaudeEvent & { request_id?: string }).request_id;
     const pending = session.messageManager.getPendingApproval();
     if (requestId && pending?.toolUseId === requestId) {
-      void session.messageManager.handleApprovalResponse(pending.postId, false);
+      // Clear synchronously: the adapter releases the next queued request the
+      // moment this one expires, and its prompt is skipped while a pending
+      // approval is still set. The post itself is closed asynchronously.
+      session.messageManager.clearPendingApproval();
+      void updatePost(session, pending.postId, `❌ ${session.platform.getFormatter().formatBold('Action denied')} - the request expired`);
     }
   }
 
@@ -220,16 +216,28 @@ export function handleEventPreProcessing(
   if (event.type === 'agent_file') {
     const e = event as ClaudeEvent & { path?: string; caption?: string };
     const codexOut = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'generated_images');
-    const upload = (session.platform as { uploadFile?: (p: string, t: string, o?: { caption?: string }) => Promise<unknown> }).uploadFile;
-    if (e.path && upload && isInsideDir(e.path, codexOut)) {
+    const upload = (session.platform as { uploadFile?: (p: string, t: string, o?: { caption?: string; filename?: string }) => Promise<unknown> }).uploadFile;
+    // Same operator controls as send_file: outboundFiles.enabled / maxBytes,
+    // plus the regular-file/size checks of the outbound validator.
+    const outbound = session.platform.getMcpConfig().outboundFiles;
+    if (outbound?.enabled === false) {
+      sessionLog(session).info(`agent_file ignored: outbound file sending is disabled by the operator`);
+    } else if (e.path && upload) {
       const path = e.path;
       const caption = e.caption?.slice(0, 300);
-      void withErrorHandling(
-        () => upload.call(session.platform, path, session.threadId, caption ? { caption } : undefined),
-        { action: 'Upload agent-generated file', session },
-      );
+      void withErrorHandling(async () => {
+        const validated = await validateOutboundPath(path, {
+          allowedRoots: [codexOut],
+          maxBytes: outbound?.maxBytes && outbound.maxBytes > 0 ? outbound.maxBytes : DEFAULT_OUTBOUND_MAX_BYTES,
+        });
+        if (!validated.ok) {
+          sessionLog(session).warn(`agent_file ignored: ${validated.reason}`);
+          return;
+        }
+        await upload.call(session.platform, validated.resolvedPath, session.threadId, { caption, filename: validated.basename });
+      }, { action: 'Upload agent-generated file', session });
     } else {
-      sessionLog(session).warn(`agent_file ignored: ${e.path ?? '(no path)'} is not under ${codexOut}`);
+      sessionLog(session).warn(`agent_file ignored: ${e.path ?? '(no path)'}`);
     }
   }
 
@@ -693,6 +701,12 @@ function updateUsageStats(
       primaryModel = modelId;
       contextWindowSize = usage.contextWindow;
     }
+  }
+
+  // No cost information (Codex): the single reported model is the primary.
+  if (!primaryModel) {
+    const [only] = Object.keys(result.modelUsage);
+    if (only) { primaryModel = only; contextWindowSize = result.modelUsage[only].contextWindow; }
   }
 
   // The current model (from the per-turn init event) beats the cost

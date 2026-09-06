@@ -147,6 +147,9 @@ export class CodexSession extends EventEmitter implements AgentSession {
       this.rpc.kill();
       throw err;
     });
+    // Nobody may ever await `ready` (resume that fails before the first user
+    // message): keep the rejection for sendMessage(), but not unhandled.
+    this.ready.catch(() => {});
   }
 
   sendMessage(content: string): void {
@@ -167,6 +170,7 @@ export class CodexSession extends EventEmitter implements AgentSession {
       // rejected turn/start must close that state like a failed turn.
       this.log.error(`turn/start failed: ${err}`);
       const message = err instanceof Error ? err.message : String(err);
+      this.assistant({ type: 'text', text: `❌ Codex did not start the turn: ${message}` });
       this.emitEvent({ type: 'system', subtype: 'error', error: message });
       this.emitEvent({ type: 'result', subtype: 'error_turn_start', is_error: true, result: message, duration_ms: 0, num_turns: 0, session_id: this.threadId });
     });
@@ -318,6 +322,22 @@ export class CodexSession extends EventEmitter implements AgentSession {
           duration_ms: Date.now() - this.turnStartedAt,
           num_turns: 1,
           session_id: this.threadId,
+          // Same shape the Claude CLI puts on its result: this is what fills
+          // the session header (model, context %). Codex reports no cost.
+          ...(this.status ? {
+            total_cost_usd: 0,
+            usage: this.status.current_usage,
+            modelUsage: {
+              [this.model]: {
+                inputTokens: this.status.total_input_tokens,
+                outputTokens: this.status.total_output_tokens,
+                cacheReadInputTokens: this.status.current_usage?.cache_read_input_tokens ?? 0,
+                cacheCreationInputTokens: this.status.current_usage?.cache_creation_input_tokens ?? 0,
+                contextWindow: this.status.context_window_size,
+                costUSD: 0,
+              },
+            },
+          } : {}),
         });
         return;
       }
@@ -495,12 +515,12 @@ export class CodexSession extends EventEmitter implements AgentSession {
   }
 
   private askUser(toolName: string, content: string): Promise<ApprovalDecision> {
-    if (this.sessionApproved || (this.options.permissionMode ?? 'default') === 'bypass') {
-      return Promise.resolve('accept');
-    }
     const epoch = this.turnEpoch;
     const run = () => new Promise<ApprovalDecision>((resolve) => {
       if (epoch !== this.turnEpoch) { resolve('decline'); return; } // turn was interrupted meanwhile
+      // Checked here, not before queueing: a ✅ on the prompt ahead of us in
+      // the queue covers this request too.
+      if (this.sessionApproved || (this.options.permissionMode ?? 'default') === 'bypass') { resolve('accept'); return; }
       const requestId = randomUUID();
       const timeoutMs = this.options.permissionTimeoutMs ?? 120000;
       const timer = setTimeout(() => {

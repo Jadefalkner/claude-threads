@@ -6,7 +6,8 @@
  * responses `id`+`result|error`, notifications `method` only, and server→client
  * requests (approvals) carry `id`+`method` and expect a response with that id.
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import type { ChildProcessWithoutNullStreams } from 'child_process';
+import { crossSpawn } from '../../utils/spawn.js';
 import { createInterface } from 'readline';
 import type { Logger } from '../../utils/logger.js';
 
@@ -31,8 +32,12 @@ export class CodexAppServer {
 
   spawn(cwd: string, env: NodeJS.ProcessEnv = process.env): void {
     if (this.proc) throw new Error('Already running');
-    const proc = spawn(this.bin, ['app-server', '--listen', 'stdio://'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = crossSpawn(this.bin, ['app-server', '--listen', 'stdio://'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     this.proc = proc;
+    // A write into a stdin the server already closed raises EPIPE as a
+    // stream 'error'; without a listener that is an uncaught exception that
+    // takes the whole bot down. The pending request fails via exit/timeout.
+    proc.stdin.on('error', (err) => this.log.debug(`stdin: ${(err as NodeJS.ErrnoException).code ?? err.message}`));
     createInterface({ input: proc.stdout }).on('line', (line) => this.handle(line));
     proc.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString();

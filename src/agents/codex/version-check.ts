@@ -1,5 +1,13 @@
-import { execFileSync } from 'child_process';
+import { crossSpawnSync } from '../../utils/spawn.js';
 import { CODEX_PROTOCOL_VERSION } from './app-server.js';
+
+/** Run the CLI; returns stdout on exit 0, throws otherwise (covers .cmd wrappers on Windows). */
+function run(bin: string, args: string[]): string {
+  const r = crossSpawnSync(bin, args, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`exit ${r.status}: ${String(r.stderr).trim()}`);
+  return String(r.stdout);
+}
 
 export interface CodexValidationResult {
   installed: boolean;
@@ -17,13 +25,13 @@ export interface CodexValidationResult {
 export function validateCodexCli(bin = process.env.CODEX_BIN ?? 'codex'): CodexValidationResult {
   let version: string;
   try {
-    version = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 10000 }).trim().replace(/^codex-cli\s+/, '');
+    version = run(bin, ['--version']).trim().replace(/^codex-cli\s+/, '');
   } catch (err) {
     return { installed: false, version: null, loggedIn: false, message: `Codex CLI not found (${bin}): ${String(err).split('\n')[0]}` };
   }
   let loggedIn = false;
   try {
-    execFileSync(bin, ['login', 'status'], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+    run(bin, ['login', 'status']);
     loggedIn = true;
   } catch { /* non-zero exit = not logged in */ }
   const drift = version !== CODEX_PROTOCOL_VERSION ? ` (protocol bindings pinned to ${CODEX_PROTOCOL_VERSION})` : '';
