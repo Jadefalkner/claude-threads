@@ -221,9 +221,10 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
    * Post the current question in the question set.
    */
   async postCurrentQuestion(ctx: ExecutorContext): Promise<void> {
-    if (!this.state.pendingQuestionSet) return;
+    const set = this.state.pendingQuestionSet;
+    if (!set) return;
 
-    const { currentIndex, questions } = this.state.pendingQuestionSet;
+    const { currentIndex, questions } = set;
     if (currentIndex >= questions.length) return;
 
     const q = questions[currentIndex];
@@ -254,11 +255,22 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       {
         type: 'question',
         interactionType: 'question',
-        toolUseId: this.state.pendingQuestionSet.toolUseId,
+        toolUseId: set.toolUseId,
       }
     );
 
-    this.state.pendingQuestionSet.currentPostId = post.id;
+    if (this.state.pendingQuestionSet !== set) {
+      // Expired or superseded while the post was being created: never let
+      // this post become the replacement set's current question.
+      ctx.logger.info(`Question set ${formatShortId(set.toolUseId)} expired while its post was being created`);
+      try {
+        await ctx.platform.updatePost(post.id, `❌ ${ctx.formatter.formatBold('Question expired')}`);
+      } catch (err) {
+        ctx.logger.debug(`Failed to close expired question post: ${err}`);
+      }
+      return;
+    }
+    set.currentPostId = post.id;
   }
 
   /**
@@ -270,10 +282,11 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
     optionIndex: number,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingQuestionSet) return false;
-    if (this.state.pendingQuestionSet.currentPostId !== postId) return false;
+    const set = this.state.pendingQuestionSet;
+    if (!set) return false;
+    if (set.currentPostId !== postId) return false;
 
-    const { currentIndex, questions, toolUseId } = this.state.pendingQuestionSet;
+    const { currentIndex, questions, toolUseId } = set;
     const question = questions[currentIndex];
     if (!question) return false;
 
@@ -294,10 +307,13 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       ctx.logger.debug(`Failed to update question post: ${err}`);
     }
 
-    // Move to next question or finish
-    this.state.pendingQuestionSet.currentIndex++;
+    // The set may have expired or been replaced during the post update.
+    if (this.state.pendingQuestionSet !== set) return true;
 
-    if (this.state.pendingQuestionSet.currentIndex < questions.length) {
+    // Move to next question or finish
+    set.currentIndex++;
+
+    if (set.currentIndex < questions.length) {
       // Post next question
       await this.postCurrentQuestion(ctx);
     } else {
@@ -331,8 +347,9 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
     ctx: ExecutorContext,
     allowAll = false
   ): Promise<boolean> {
+    const pending = this.state.pendingApproval;
     return completePendingPrompt({
-      pending: this.state.pendingApproval,
+      pending,
       postId,
       ctx,
       label: 'approval',
@@ -343,7 +360,9 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
           ? `✅ ${ctx.formatter.formatBold(type === 'plan' ? 'Plan approved' : 'Action approved')} - proceeding...`
           : `❌ ${ctx.formatter.formatBold(type === 'plan' ? 'Changes requested' : 'Action denied')}`;
       },
-      clear: () => { this.state.pendingApproval = null; },
+      // Only release the slot we answered: the request may have expired during
+      // the post update and a replacement may already own the slot.
+      clear: () => { if (this.state.pendingApproval === pending) this.state.pendingApproval = null; },
       emit: ({ toolUseId }) => this.events?.emit('approval:complete', { toolUseId, approved, allowAll }),
     });
   }
