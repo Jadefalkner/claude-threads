@@ -221,7 +221,7 @@ describe('QuestionApprovalExecutor', () => {
         executor.clearPendingApproval();
         return original(...args);
       };
-      ctx.platform.updatePost = async (postId: string, message: string) => { updates.push([postId, message]); };
+      ctx.platform.updatePost = async (postId: string, message: string) => { updates.push([postId, message]); return { id: postId } as PlatformPost; };
       await executor.execute(op, ctx);
       expect(executor.hasPendingApproval()).toBe(false); // the expired request was not installed
       expect(updates).toHaveLength(1);
