@@ -980,15 +980,17 @@ async function startWithoutDaemon() {
     // Guard against multiple shutdown calls (SIGINT + SIGTERM)
     if (isShuttingDown) return;
     isShuttingDown = true;
+    // Set the shutdown flag before ANY await: a service manager that signals
+    // the whole process group (systemd KillMode=control-group) kills the
+    // agent children at the same instant, and their exit events must not be
+    // mistaken for resume failures while we are still yielding to React.
+    session.setShuttingDown();
 
     // Update status bar to show shutdown in progress
     ui.setShuttingDown();
 
     // Give React a moment to render the shutdown state
     await new Promise((resolve) => setTimeout(resolve, 50));
-
-    // Set shutdown flag FIRST to prevent race conditions with exit events
-    session.setShuttingDown();
 
     // Update sticky messages to show shutdown state
     await session.updateAllStickyMessages();
