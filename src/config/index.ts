@@ -52,6 +52,7 @@ export {
   DEFAULT_OVERHEAD_VISIBILITY,
   isOverheadVisibility,
   resolveOverheadVisibility,
+  resolveReconnectPolicy,
 } from './types.js';
 
 import type { Config, WorktreeMode as WorktreeModeType, PermissionMode, OverheadVisibility } from './types.js';
