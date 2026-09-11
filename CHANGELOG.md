@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **⚠️ Two bots sharing one `$HOME` will no longer both start** (#557). A one-process-per-root lock now refuses the second, naming the pid that holds it and the fix. This is a deliberate break of a setup that appeared to work: the two instances were writing the same `sessions.json` and quietly losing each other's sessions. If you run more than one bot as the same user, give each its own `CLAUDE_THREADS_HOME` before upgrading. A lock left behind by a killed process is taken over automatically.
 
+### Fixed
+- **Verifying the `bugReports` gate no longer files a public issue** (#586). `createGitHubIssue` called `execSync` directly, so the one test that proves the gate is load-bearing reached the real `gh` CLI the moment the gate was removed. Anyone following the repo's own red-green rule therefore filed a public issue titled "T" from their test suite, three times in one afternoon (#581, #582, #583). The command is now injectable, the same way `checkGitHubCli` already was, and the test passes a stub and asserts directly that no subprocess runs. A second case covers the other direction, so a stub that was never wired up cannot make the first one pass for the wrong reason.
+
 ## [1.36.1] - 2026-09-10
 
 ### Fixed
