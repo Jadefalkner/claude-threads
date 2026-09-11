@@ -8,7 +8,7 @@
  * - Processing user responses via reactions
  */
 
-import { NUMBER_EMOJIS, APPROVAL_EMOJIS, DENIAL_EMOJIS, isApprovalEmoji, isDenialEmoji, getNumberEmojiIndex } from '../../utils/emoji.js';
+import { NUMBER_EMOJIS, APPROVAL_EMOJIS, DENIAL_EMOJIS, isApprovalEmoji, isDenialEmoji, getNumberEmojiIndex, isAllowAllEmoji, ALLOW_ALL_EMOJIS } from '../../utils/emoji.js';
 import { auditLog } from '../../persistence/audit-log.js';
 import { formatShortId } from '../../utils/format.js';
 import { completePendingPrompt } from './pending-prompt.js';
@@ -181,47 +181,53 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       }
       message +=
         `👍 Approve\n` +
-        `👎 Deny\n\n` +
+        `👎 Deny\n` +
+        `✅ Approve for the rest of this session\n\n` +
         ctx.formatter.formatItalic('React to respond');
     }
 
-    let claimed = false;
-    // Create interactive post with approval reactions.
-    //
-    // Same reasoning as postCurrentQuestion: claim pendingApproval in the
-    // pre-reaction callback so a 👍 that lands while we are still adding the
-    // 👍/👎 options is matched instead of discarded — otherwise the bridged
-    // ExitPlanMode call blocks until MCP_TOOL_TIMEOUT on an approval the user
-    // already gave.
-    const post = await ctx.createInteractivePost(
-      message,
-      [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]],
-      {
-        type: 'plan_approval',
-        interactionType: 'plan_approval',
-        toolUseId: op.toolUseId,
-      },
-      (created) => {
-        claimed = true;
-        this.state.pendingApproval = {
-          postId: created.id,
-          type: op.approvalType,
-          toolUseId: op.toolUseId,
-        };
-      }
-    );
+    // Reserve the slot before the post exists: an approval that expires or is
+    // interrupted while the post is still being created clears this entry,
+    // and the check after the await then closes the fresh post instead of
+    // installing a request nobody can answer any more.
+    const reserved = { postId: '', type: op.approvalType, toolUseId: op.toolUseId };
+    this.state.pendingApproval = reserved;
 
-    // Defensive: only when the callback never ran (a platform override that
-    // ignores it). Never re-arm after it did — the reaction it was waiting
-    // for may already have arrived and cleared the pending state, and
-    // resurrecting it here would swallow the next decision.
-    if (!claimed) {
-      this.state.pendingApproval = {
-        postId: post.id,
-        type: op.approvalType,
-        toolUseId: op.toolUseId,
-      };
+    // Create interactive post with approval reactions. The post id is claimed
+    // in the pre-reaction callback (upstream #587) so a 👍 that lands while the
+    // 👍/👎 options are still being added is matched instead of discarded —
+    // otherwise the bridged call blocks until MCP_TOOL_TIMEOUT on an approval
+    // the user already gave.
+    let post;
+    try {
+      post = await ctx.createInteractivePost(
+        message,
+        // ✅ only for actions — plans have no session-wide variant
+        op.approvalType === 'plan'
+          ? [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0]]
+          : [APPROVAL_EMOJIS[0], DENIAL_EMOJIS[0], ALLOW_ALL_EMOJIS[0]],
+        {
+          type: 'plan_approval',
+          interactionType: 'plan_approval',
+          toolUseId: op.toolUseId,
+        },
+        (created) => {
+          if (this.state.pendingApproval === reserved) reserved.postId = created.id;
+        }
+      );
+    } catch (err) {
+      // A reservation without a post can never be answered: release it, unless
+      // a replacement already owns the slot.
+      if (this.state.pendingApproval === reserved) this.state.pendingApproval = null;
+      throw err;
     }
+
+    if (this.state.pendingApproval !== reserved) {
+      ctx.logger.info(`${op.approvalType} approval ${formatShortId(op.toolUseId)} expired while its post was being created`);
+      await ctx.platform.updatePost(post.id, `❌ ${ctx.formatter.formatBold('Action denied')} - the request expired`);
+      return;
+    }
+    reserved.postId = post.id;
 
     ctx.logger.debug(`Created ${op.approvalType} approval post ${formatShortId(post.id)}`);
   }
@@ -230,9 +236,10 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
    * Post the current question in the question set.
    */
   async postCurrentQuestion(ctx: ExecutorContext): Promise<void> {
-    if (!this.state.pendingQuestionSet) return;
+    const set = this.state.pendingQuestionSet;
+    if (!set) return;
 
-    const { currentIndex, questions } = this.state.pendingQuestionSet;
+    const { currentIndex, questions } = set;
     if (currentIndex >= questions.length) return;
 
     const q = questions[currentIndex];
@@ -272,22 +279,32 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       {
         type: 'question',
         interactionType: 'question',
-        toolUseId: this.state.pendingQuestionSet.toolUseId,
+        toolUseId: set.toolUseId,
       },
       (created) => {
         claimed = true;
-        if (this.state.pendingQuestionSet) {
-          this.state.pendingQuestionSet.currentPostId = created.id;
+        if (this.state.pendingQuestionSet === set) {
+          set.currentPostId = created.id;
         }
       }
     );
 
+    if (this.state.pendingQuestionSet !== set) {
+      // Expired or superseded while the post was being created: never let
+      // this post become the replacement set's current question.
+      ctx.logger.info(`Question set ${formatShortId(set.toolUseId)} expired while its post was being created`);
+      try {
+        await ctx.platform.updatePost(post.id, `❌ ${ctx.formatter.formatBold('Question expired')}`);
+      } catch (err) {
+        ctx.logger.debug(`Failed to close expired question post: ${err}`);
+      }
+      return;
+    }
     // Defensive: only when the callback never ran (a platform override that
     // ignores it). Never overwrite after it did — by then the answer may
-    // already have advanced or cleared the set, and re-pointing it at this
-    // post would re-open a question the user has answered.
-    if (!claimed && this.state.pendingQuestionSet) {
-      this.state.pendingQuestionSet.currentPostId = post.id;
+    // already have advanced or cleared the set.
+    if (!claimed) {
+      set.currentPostId = post.id;
     }
   }
 
@@ -300,10 +317,11 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
     optionIndex: number,
     ctx: ExecutorContext
   ): Promise<boolean> {
-    if (!this.state.pendingQuestionSet) return false;
-    if (this.state.pendingQuestionSet.currentPostId !== postId) return false;
+    const set = this.state.pendingQuestionSet;
+    if (!set) return false;
+    if (set.currentPostId !== postId) return false;
 
-    const { currentIndex, questions, toolUseId } = this.state.pendingQuestionSet;
+    const { currentIndex, questions, toolUseId } = set;
     const question = questions[currentIndex];
     if (!question) return false;
 
@@ -324,10 +342,13 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
       ctx.logger.debug(`Failed to update question post: ${err}`);
     }
 
-    // Move to next question or finish
-    this.state.pendingQuestionSet.currentIndex++;
+    // The set may have expired or been replaced during the post update.
+    if (this.state.pendingQuestionSet !== set) return true;
 
-    if (this.state.pendingQuestionSet.currentIndex < questions.length) {
+    // Move to next question or finish
+    set.currentIndex++;
+
+    if (set.currentIndex < questions.length) {
       // Post next question
       await this.postCurrentQuestion(ctx);
     } else {
@@ -358,21 +379,26 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
   handleApprovalResponse(
     postId: string,
     approved: boolean,
-    ctx: ExecutorContext
+    ctx: ExecutorContext,
+    allowAll = false
   ): Promise<boolean> {
+    const pending = this.state.pendingApproval;
     return completePendingPrompt({
-      pending: this.state.pendingApproval,
+      pending,
       postId,
       ctx,
       label: 'approval',
       statusMessage: ({ type }) => {
         ctx.logger.info(`${type} ${approved ? 'approved' : 'rejected'}`);
+        if (allowAll) return `✅ ${ctx.formatter.formatBold('Action approved for the rest of this session')} - proceeding...`;
         return approved
           ? `✅ ${ctx.formatter.formatBold(type === 'plan' ? 'Plan approved' : 'Action approved')} - proceeding...`
           : `❌ ${ctx.formatter.formatBold(type === 'plan' ? 'Changes requested' : 'Action denied')}`;
       },
-      clear: () => { this.state.pendingApproval = null; },
-      emit: ({ toolUseId }) => this.events?.emit('approval:complete', { toolUseId, approved }),
+      // Only release the slot we answered: the request may have expired during
+      // the post update and a replacement may already own the slot.
+      clear: () => { if (this.state.pendingApproval === pending) this.state.pendingApproval = null; },
+      emit: ({ toolUseId }) => this.events?.emit('approval:complete', { toolUseId, approved, allowAll }),
     });
   }
 
@@ -461,6 +487,12 @@ export class QuestionApprovalExecutor extends BaseExecutor<QuestionApprovalState
         const handled = await this.handleApprovalResponse(postId, true, ctx);
         ctx.logger.debug(`QuestionApprovalExecutor: approval outcome=approved, handled=${handled}`);
         return handled;
+      }
+      // ✅ = allow-all: approve and stop prompting for the rest of the session.
+      // Action prompts only (Codex backend); plan approvals keep ignoring it.
+      if (approvalType === 'action' && isAllowAllEmoji(emoji)) {
+        ctx.logger.debug(`Allow-all reaction from @${user}: approved for session`);
+        return this.handleApprovalResponse(postId, true, ctx, true);
       }
       if (isDenialEmoji(emoji)) {
         ctx.logger.debug(`Approval reaction from @${user}: denied`);

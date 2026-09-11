@@ -1,3 +1,5 @@
+import type { AgentBackend } from '../agents/types.js';
+import { stateHome } from '../utils/state-home.js';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { writeFileAtomic } from './atomic-file.js';
 import { join } from 'path';
@@ -7,7 +9,6 @@ import type { PlatformFile } from '../platform/types.js';
 import type { PersistedTrackedTask } from '../operations/task-tracker.js';
 import type { ContextPromptFile } from '../operations/executors/types.js';
 import type { OverheadVisibility } from '../config/types.js';
-import { stateHome } from '../utils/state-home.js';
 
 const log = createLogger('persist');
 
@@ -88,6 +89,7 @@ export interface PersistedSession {
   platformId: string;            // Which platform instance (e.g., 'default', 'mattermost-main')
   threadId: string;              // Thread ID within that platform
   claudeSessionId: string;       // UUID for --session-id / --resume
+  agentBackend?: AgentBackend;   // 'claude' | 'codex'; absent on pre-backend data → claude
   startedBy: string;             // Username who started the session
   startedByDisplayName?: string; // Display name for UI
   startedAt: string;             // ISO date

@@ -1,3 +1,4 @@
+import type { AgentSession } from '../agents/types.js';
 import { ChildProcess } from 'child_process';
 import { BOT_MCP_SERVER_NAME, isRemoteMcpServer, type McpServerConfig } from '../config/types.js';
 import { crossSpawn } from '../utils/spawn.js';
@@ -409,53 +410,26 @@ export function materializeMcpConfig(
  * was written to disk (i.e. not inline-mode) and must be cleaned up by the
  * caller on process exit.
  */
-export function buildPermissionArgs(opts: {
-  permissionMode: PermissionMode;
+export const MCP_SERVER_NAME = 'claude-threads-mcp';
+
+/**
+ * The bot's own MCP server (permission prompts, send_file, read_post,
+ * agent actions …) as a stdio server definition. Shared by the Claude CLI
+ * (`--mcp-config`) and the Codex app-server (`mcp_servers` thread config).
+ */
+export function buildMcpServerDefinition(opts: {
   mcpServerPath: string;
-  platformConfig: PlatformMcpConfig | undefined;
+  platformConfig: PlatformMcpConfig;
   threadId: string | undefined;
-  sessionId: string | undefined;
   permissionTimeoutMs: number;
   debug: boolean;
-  /** Session working directory; passed to MCP child as SESSION_WORKING_DIR. */
   workingDir?: string;
-  /** Per-session upload directory; passed to MCP child as SESSION_UPLOAD_DIR. */
   uploadDir?: string;
-  /** Outbound file (`send_file`) settings. Both fields are optional. */
   outboundFiles?: { enabled?: boolean; maxBytes?: number };
-  /** Username of the session starter; surfaced to the MCP child as
-   *  SESSION_OWNER_USERNAME for `send_dm` attribution. */
   sessionOwnerUsername?: string;
-  /** Decision-bridge socket path; surfaced as DECISION_BRIDGE_PATH. */
   decisionBridgePath?: string;
-  /** Agent-feature tool gates for the MCP child; see ClaudeCliOptions. */
   agentFeatures?: ClaudeCliOptions['agentFeatures'];
-  inline?: boolean; // for tests
-}): { args: string[]; tempFile: string | null } {
-  const args: string[] = [];
-
-  // bypass-mode: tools run without user approval. We still spawn the MCP
-  // server (no --permission-prompt-tool, so the permission_prompt tool
-  // dangles harmlessly) so that send_file remains available — this is the
-  // mode operators most often use for build-anything-on-demand setups,
-  // exactly the workflow where send_file is most useful. Pre-#360 the
-  // server wasn't spawned at all; the change is intentional and additive.
-  //
-  // platformConfig is required even in bypass-mode now, because send_file
-  // talks to the platform REST API. If a deployment really has no platform
-  // (extremely unusual; only the dry-run / shell-driven test fixtures),
-  // pass platformConfig: undefined and accept that send_file won't work.
-  if (opts.permissionMode === 'bypass' && !opts.platformConfig) {
-    args.push('--dangerously-skip-permissions');
-    return { args, tempFile: null };
-  }
-
-  if (!opts.platformConfig) {
-    throw new Error(
-      `platformConfig is required when permissionMode is '${opts.permissionMode}'`,
-    );
-  }
-
+}): { command: string; args: string[]; env: Record<string, string> } {
   const mcpEnv: Record<string, string> = {
     PLATFORM_TYPE: opts.platformConfig.type,
     PLATFORM_URL: opts.platformConfig.url,
@@ -514,17 +488,64 @@ export function buildPermissionArgs(opts: {
     mcpEnv[OUTBOUND_ENV.OUTBOUND_FILES_MAX_BYTES] = String(opts.outboundFiles.maxBytes);
   }
 
-  const mcpConfig: McpConfigBlob = {
-    mcpServers: {
-      'claude-threads-mcp': {
-        type: 'stdio',
-        command: runtimeForScriptPath(opts.mcpServerPath),
-        args: [opts.mcpServerPath],
-        env: mcpEnv,
-      },
-    },
+  return {
+    command: runtimeForScriptPath(opts.mcpServerPath),
+    args: [opts.mcpServerPath],
+    env: mcpEnv,
   };
+}
 
+export function buildPermissionArgs(opts: {
+  permissionMode: PermissionMode;
+  mcpServerPath: string;
+  platformConfig: PlatformMcpConfig | undefined;
+  threadId: string | undefined;
+  sessionId: string | undefined;
+  permissionTimeoutMs: number;
+  debug: boolean;
+  /** Session working directory; passed to MCP child as SESSION_WORKING_DIR. */
+  workingDir?: string;
+  /** Per-session upload directory; passed to MCP child as SESSION_UPLOAD_DIR. */
+  uploadDir?: string;
+  /** Outbound file (`send_file`) settings. Both fields are optional. */
+  outboundFiles?: { enabled?: boolean; maxBytes?: number };
+  /** Username of the session starter; surfaced to the MCP child as
+   *  SESSION_OWNER_USERNAME for `send_dm` attribution. */
+  sessionOwnerUsername?: string;
+  /** Decision-bridge socket path; surfaced as DECISION_BRIDGE_PATH. */
+  decisionBridgePath?: string;
+  /** Agent-feature tool gates for the MCP child; see ClaudeCliOptions. */
+  agentFeatures?: ClaudeCliOptions['agentFeatures'];
+  inline?: boolean; // for tests
+}): { args: string[]; tempFile: string | null } {
+  const args: string[] = [];
+
+  // bypass-mode: tools run without user approval. We still spawn the MCP
+  // server (no --permission-prompt-tool, so the permission_prompt tool
+  // dangles harmlessly) so that send_file remains available — this is the
+  // mode operators most often use for build-anything-on-demand setups,
+  // exactly the workflow where send_file is most useful. Pre-#360 the
+  // server wasn't spawned at all; the change is intentional and additive.
+  //
+  // platformConfig is required even in bypass-mode now, because send_file
+  // talks to the platform REST API. If a deployment really has no platform
+  // (extremely unusual; only the dry-run / shell-driven test fixtures),
+  // pass platformConfig: undefined and accept that send_file won't work.
+  if (opts.permissionMode === 'bypass' && !opts.platformConfig) {
+    args.push('--dangerously-skip-permissions');
+    return { args, tempFile: null };
+  }
+
+  if (!opts.platformConfig) {
+    throw new Error(
+      `platformConfig is required when permissionMode is '${opts.permissionMode}'`,
+    );
+  }
+
+  const definition = buildMcpServerDefinition({ ...opts, platformConfig: opts.platformConfig });
+  const mcpConfig: McpConfigBlob = {
+    mcpServers: { [MCP_SERVER_NAME]: { type: 'stdio', ...definition } },
+  };
   // Operator-declared servers ride in the same blob (so their env/headers
   // stay off argv too). The bot's own name is reserved: the config loader
   // refuses it, and this guard keeps any caller that bypasses the loader
@@ -584,7 +605,36 @@ const STDERR_AGGREGATE_SOFT_CAP = 10 * 1024 * 1024; // 10MB
 // Module-private — safe to share: every ClaudeCli runs in the same process.
 let totalStderrBytes = 0;
 
-export class ClaudeCli extends EventEmitter {
+/** Locate the bundled (dist) or source-layout MCP server script. */
+export function resolveMcpServerPath(): string {
+  {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    // When bundled with bun build, __dirname is dist/ (not dist/claude/)
+    // Try the bundled path first, then fall back to source layout
+    const bundledPath = resolve(__dirname, 'mcp', 'mcp-server.js');
+    if (existsSync(bundledPath)) {
+      return bundledPath;
+    }
+    const sourceLayoutPath = resolve(__dirname, '..', 'mcp', 'mcp-server.js');
+    if (existsSync(sourceLayoutPath)) {
+      return sourceLayoutPath;
+    }
+    // Source/dev mode (`bun run dev`, tests): no build output exists — only
+    // the TypeScript source. Point at the .ts; buildPermissionArgs runs it
+    // under the current runtime (bun) instead of node. Without this the MCP
+    // config referenced a nonexistent .js and the permission server could
+    // never spawn in dev mode.
+    const tsPath = resolve(__dirname, '..', 'mcp', 'mcp-server.ts');
+    if (existsSync(tsPath)) {
+      return tsPath;
+    }
+    return sourceLayoutPath;
+  }
+}
+
+export class ClaudeCli extends EventEmitter implements AgentSession {
+  readonly backend = 'claude' as const;
   private process: ChildProcess | null = null;
   private options: ClaudeCliOptions;
   private buffer = '';
@@ -1169,28 +1219,7 @@ export class ClaudeCli extends EventEmitter {
   }
 
   private getMcpServerPath(): string {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    // When bundled with bun build, __dirname is dist/ (not dist/claude/)
-    // Try the bundled path first, then fall back to source layout
-    const bundledPath = resolve(__dirname, 'mcp', 'mcp-server.js');
-    if (existsSync(bundledPath)) {
-      return bundledPath;
-    }
-    const sourceLayoutPath = resolve(__dirname, '..', 'mcp', 'mcp-server.js');
-    if (existsSync(sourceLayoutPath)) {
-      return sourceLayoutPath;
-    }
-    // Source/dev mode (`bun run dev`, tests): no build output exists — only
-    // the TypeScript source. Point at the .ts; buildPermissionArgs runs it
-    // under the current runtime (bun) instead of node. Without this the MCP
-    // config referenced a nonexistent .js and the permission server could
-    // never spawn in dev mode.
-    const tsPath = resolve(__dirname, '..', 'mcp', 'mcp-server.ts');
-    if (existsSync(tsPath)) {
-      return tsPath;
-    }
-    return sourceLayoutPath;
+    return resolveMcpServerPath();
   }
 
   private getStatusLineWriterPath(): string {

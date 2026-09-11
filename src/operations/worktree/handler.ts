@@ -29,7 +29,7 @@ import {
   detectWorktreeInfo,
 } from '../../git/worktree.js';
 import type { ClaudeCliOptions, ClaudeEvent } from '../../claude/cli.js';
-import { ClaudeCli } from '../../claude/cli.js';
+import { createAgentSession, type AgentSession } from '../../agents/index.js';
 import { buildRestartCliOptions } from '../../claude/restart-options.js';
 import { buildAppendSystemPrompt } from '../../commands/system-prompt-generator.js';
 import { postSkippedFilesFeedback, type BuiltMessageContent } from '../streaming/handler.js';
@@ -432,7 +432,7 @@ export async function createAndSwitchToWorktree(
     worktreeMode: WorktreeMode;
     permissionTimeoutMs?: number;
     handleEvent: (sessionId: string, event: ClaudeEvent) => void;
-    handleExit: (sessionId: string, code: number, source?: ClaudeCli) => Promise<void>;
+    handleExit: (sessionId: string, code: number, source?: AgentSession) => Promise<void>;
     updateSessionHeader: (session: Session) => Promise<void>;
     flush: (session: Session) => Promise<void>;
     persistSession: (session: Session) => void;
@@ -583,7 +583,7 @@ export async function createAndSwitchToWorktree(
         // Fresh CLI session (resume: false) — clear accumulated task/tool
         // state so the new session's task ids can't collide with stale ones.
         session.messageManager?.clearClaudeSessionState();
-        const newClaude = new ClaudeCli(cliOptions);
+        const newClaude = createAgentSession(session.agentBackend ?? 'claude', cliOptions);
         session.claude = newClaude;
 
         // Rebind event handlers
@@ -764,7 +764,7 @@ export async function createAndSwitchToWorktree(
       // Fresh CLI session (resume: false) — clear accumulated task/tool
       // state so the new session's task ids can't collide with stale ones.
       session.messageManager?.clearClaudeSessionState();
-      const newClaude = new ClaudeCli(cliOptions);
+      const newClaude = createAgentSession(session.agentBackend ?? 'claude', cliOptions);
       session.claude = newClaude;
 
       // Rebind event handlers (use sessionId which is the composite key)

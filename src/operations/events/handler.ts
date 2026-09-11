@@ -16,6 +16,9 @@ import { withErrorHandling } from '../../utils/error-handler/index.js';
 import { resetSessionActivity, post, postError, updatePost } from '../post-helpers/index.js';
 import type { SessionContext } from '../session-context/index.js';
 import { createLogger } from '../../utils/logger.js';
+import { homedir } from 'os';
+import { validateOutboundPath } from '../../mcp/path-validator.js';
+import { join } from 'path';
 import { auditDetailForTool, auditLog, isAuditEnabled } from '../../persistence/audit-log.js';
 import { createSessionLog } from '../../utils/session-log.js';
 import { extractPullRequestUrl } from '../../utils/pr-detector.js';
@@ -25,6 +28,8 @@ import { trackEvent } from '../bug-report/index.js';
 import { parseClaudeCommand, removeCommandFromText, isClaudeAllowedCommand } from '../../commands/index.js';
 
 const log = createLogger('events');
+/** Matches the MCP server's default for send_file. */
+const DEFAULT_OUTBOUND_MAX_BYTES = 100 * 1024 * 1024;
 const sessionLog = createSessionLog(log);
 
 // ---------------------------------------------------------------------------
@@ -176,6 +181,68 @@ export function handleEventPreProcessing(
   // Log raw event to thread logger (first thing, before any processing)
   session.threadLogger?.logEvent(event);
 
+  // Codex-only: the agent declined an approval after its timeout. Resolve the
+  // still-open prompt post as denied so a later reaction can't show
+  // "approved" for an action Codex never ran. (The request itself is
+  // rendered by the transformer as an 'action' approval op; the decision
+  // flows back via lifecycle's 'approval:complete' → respondToApproval.)
+  if (event.type === 'approval_timeout' && session.messageManager) {
+    const requestId = (event as ClaudeEvent & { request_id?: string }).request_id;
+    const pending = session.messageManager.getPendingApproval();
+    if (requestId && pending?.toolUseId === requestId) {
+      // Clear synchronously: the adapter releases the next queued request the
+      // moment this one expires, and its prompt is skipped while a pending
+      // approval is still set. The post itself is closed asynchronously.
+      session.messageManager.clearPendingApproval();
+      // An empty postId is a slot reserved while the post is still being
+      // created; the executor closes that post itself once it exists.
+      if (pending.postId) void updatePost(session, pending.postId, `❌ ${session.platform.getFormatter().formatBold('Action denied')} - the request expired`);
+    }
+  }
+
+  // Codex-only: the agent gave up waiting for answers. Drop the executor's
+  // pending question set so a late click on the stale post is ignored
+  // instead of being reported as an answer.
+  if (event.type === 'question_timeout' && session.messageManager) {
+    const requestId = (event as ClaudeEvent & { request_id?: string }).request_id;
+    const pending = session.messageManager.getPendingQuestionSet();
+    if (requestId && pending?.toolUseId === requestId) {
+      session.messageManager.clearPendingQuestionSet();
+      sessionLog(session).info(`Question set ${requestId} expired; ignoring late answers`);
+    }
+  }
+
+  // Codex-only: a file the agent produced natively (image generation). Upload
+  // it into the thread. Only files under Codex's own output directory are
+  // accepted — this path never goes through the MCP working-dir validator.
+  if (event.type === 'agent_file') {
+    const e = event as ClaudeEvent & { path?: string; caption?: string };
+    const codexOut = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'generated_images');
+    const upload = (session.platform as { uploadFile?: (p: string, t: string, o?: { caption?: string; filename?: string }) => Promise<unknown> }).uploadFile;
+    // Same operator controls as send_file: outboundFiles.enabled / maxBytes,
+    // plus the regular-file/size checks of the outbound validator.
+    const outbound = session.platform.getMcpConfig().outboundFiles;
+    if (outbound?.enabled === false) {
+      sessionLog(session).info(`agent_file ignored: outbound file sending is disabled by the operator`);
+    } else if (e.path && upload) {
+      const path = e.path;
+      const caption = e.caption?.slice(0, 300);
+      void withErrorHandling(async () => {
+        const validated = await validateOutboundPath(path, {
+          allowedRoots: [codexOut],
+          maxBytes: outbound?.maxBytes && outbound.maxBytes > 0 ? outbound.maxBytes : DEFAULT_OUTBOUND_MAX_BYTES,
+        });
+        if (!validated.ok) {
+          sessionLog(session).warn(`agent_file ignored: ${validated.reason}`);
+          return;
+        }
+        await upload.call(session.platform, validated.resolvedPath, session.threadId, { caption, filename: validated.basename });
+      }, { action: 'Upload agent-generated file', session });
+    } else {
+      sessionLog(session).warn(`agent_file ignored: ${e.path ?? '(no path)'}`);
+    }
+  }
+
   // Audit trail (opt-in per platform): record every tool call, including
   // subagent sidechains — an auditor wants the full execution record even
   // when the thread display skips it. The whole tap is wrapped so a
@@ -231,6 +298,7 @@ export function handleEventPreProcessing(
       slash_commands?: string[];
       model?: string;
       mcp_servers?: Array<{ name?: string; status?: string }>;
+      session_id?: string;
     };
 
     // Log which MCP servers the CLI actually connected. init is re-emitted
@@ -279,6 +347,15 @@ export function handleEventPreProcessing(
     // /model switch is reflected on the very next turn — see captures).
     if (e.subtype === 'init' && typeof e.model === 'string') {
       session.currentModel = e.model;
+    }
+
+    // The backend owns the resumable id. Claude echoes the id we passed;
+    // Codex mints its own thread id on thread/start — adopt it here, after
+    // the start succeeded, so a later resume targets the real thread.
+    if (e.subtype === 'init' && typeof e.session_id === 'string' && e.session_id !== session.claudeSessionId) {
+      sessionLog(session).info(`Adopting backend session id ${e.session_id}`);
+      session.claudeSessionId = e.session_id;
+      ctx.ops.persistSession(session);
     }
 
     // Capture available slash commands from init event
@@ -669,6 +746,12 @@ function updateUsageStats(
       primaryModel = modelId;
       contextWindowSize = usage.contextWindow;
     }
+  }
+
+  // No cost information (Codex): the single reported model is the primary.
+  if (!primaryModel) {
+    const [only] = Object.keys(result.modelUsage);
+    if (only) { primaryModel = only; contextWindowSize = result.modelUsage[only].contextWindow; }
   }
 
   // The current model (from the per-turn init event) beats the cost

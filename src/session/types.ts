@@ -2,7 +2,7 @@
  * Session management types and interfaces
  */
 
-import type { ClaudeCli } from '../claude/cli.js';
+import type { AgentBackend, AgentSession } from '../agents/index.js';
 import type { PlatformClient, PlatformFile } from '../platform/index.js';
 import type { OverheadVisibility, PermissionMode } from '../config/index.js';
 import type { WorktreeInfo } from '../persistence/session-store.js';
@@ -267,11 +267,14 @@ export interface Session {
   workingDir: string;
 
   // Claude process
-  claude: ClaudeCli;
+  claude: AgentSession;
 
   // Claude account id the session is running under (when the bot is configured
   // with a `claudeAccounts` pool). Undefined in single-account mode.
   claudeAccountId?: string;
+
+  /** Backend this session was started with. Undefined on pre-backend data = 'claude'. */
+  agentBackend?: AgentBackend;
 
   /**
    * True for unattended runs (routine fires, watch fires). Gates the

@@ -12,7 +12,8 @@
  */
 
 import type { Session } from '../../session/types.js';
-import type { ClaudeCli, ClaudeEvent } from '../../claude/cli.js';
+import type { ClaudeEvent } from '../../claude/cli.js';
+import type { AgentBackend, AgentSession } from '../../agents/index.js';
 import type { PlatformClient, PlatformFile } from '../../platform/index.js';
 import type { SessionStore } from '../../persistence/session-store.js';
 import type { GitHubEmailsStore } from '../../persistence/github-emails-store.js';
@@ -44,6 +45,8 @@ export interface SessionConfig {
   permissionMode: PermissionMode;
   /** Whether Chrome browser automation is enabled */
   chromeEnabled: boolean;
+  /** Backend for new sessions; undefined = 'claude'. */
+  agentBackend?: AgentBackend;
   /**
    * Config default for the per-session "respond only when @mentioned" toggle
    * (#402). Seeds `Session.respondOnlyWhenMentioned` on new sessions. Default
@@ -213,7 +216,7 @@ export interface SessionOperations {
    * process dying — without it, a stale exit tears down the restarted
    * session.
    */
-  handleExit(sessionId: string, code: number, source?: ClaudeCli): Promise<void>;
+  handleExit(sessionId: string, code: number, source?: AgentSession): Promise<void>;
 
   // ---------------------------------------------------------------------------
   // Session Lifecycle

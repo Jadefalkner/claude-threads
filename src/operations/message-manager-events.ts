@@ -48,6 +48,8 @@ export interface MessageManagerEventMap {
   'approval:complete': {
     toolUseId: string;
     approved: boolean;
+    /** ✅ on an action prompt: approve and auto-approve the rest of the session. */
+    allowAll?: boolean;
   };
 
   /**
