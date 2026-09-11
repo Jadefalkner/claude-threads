@@ -22,6 +22,8 @@ export type {
   PermissionMode,
   OverheadVisibility,
   PlatformOverhead,
+  TurnMarkerMode,
+  TurnMarkerSettings,
   MemoryOption,
   ResolvedMemoryConfig,
   McpServerConfig,
@@ -53,6 +55,9 @@ export {
   DEFAULT_OVERHEAD_VISIBILITY,
   isOverheadVisibility,
   resolveOverheadVisibility,
+  DEFAULT_TURN_MARKER,
+  TURN_COMPLETE_EVENT_TYPE,
+  resolveTurnMarker,
   resolveReconnectPolicy,
 } from './types.js';
 
