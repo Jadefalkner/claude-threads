@@ -768,6 +768,10 @@ async function startWithoutDaemon() {
           platformConfig.stickyMessage,
           `platforms[${platformConfig.id}].stickyMessage`,
         ),
+        lifecycle: resolveOverheadVisibility(
+          platformConfig.lifecycle,
+          `platforms[${platformConfig.id}].lifecycle`,
+        ),
         turnMarker: resolveTurnMarker(
           platformConfig.turnMarker,
           platformConfig.turnMarkerEmoji,
@@ -827,6 +831,11 @@ async function startWithoutDaemon() {
         overhead: {
           sessionHeader: resolveOverheadVisibility(dmConfig.sessionHeader, `dm[${dmConfig.id}].sessionHeader`),
           stickyMessage: 'hidden',
+          // `addPlatform` takes a Partial<PlatformOverhead>, so the required-
+          // field compiler net does not reach this site and an omitted
+          // `lifecycle` silently resets DM channels to `full` — which are
+          // exactly the assistant-style channels #505 is about.
+          lifecycle: resolveOverheadVisibility(dmConfig.lifecycle, `dm[${dmConfig.id}].lifecycle`),
           // A derived DM config spreads its parent, so the parent's marker carries over.
           turnMarker: resolveTurnMarker(dmConfig.turnMarker, dmConfig.turnMarkerEmoji, dmConfig.type, `dm[${dmConfig.id}]`),
         },

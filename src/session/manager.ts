@@ -41,6 +41,7 @@ import * as events from '../operations/events/index.js';
 import * as commands from '../operations/commands/index.js';
 import * as lifecycle from './lifecycle.js';
 import { CHAT_PLATFORM_PROMPT } from './lifecycle.js';
+import { shouldPostLifecycle } from './lifecycle-visibility.js';
 import * as worktreeModule from '../operations/worktree/index.js';
 import * as contextPrompt from '../operations/context-prompt/index.js';
 import * as stickyMessage from '../operations/sticky-message/index.js';
@@ -291,6 +292,7 @@ export class SessionManager extends EventEmitter {
     this.platformOverhead.set(platformId, {
       sessionHeader: options?.overhead?.sessionHeader ?? DEFAULT_OVERHEAD_VISIBILITY,
       stickyMessage: options?.overhead?.stickyMessage ?? DEFAULT_OVERHEAD_VISIBILITY,
+      lifecycle: options?.overhead?.lifecycle ?? DEFAULT_OVERHEAD_VISIBILITY,
       turnMarker: options?.overhead?.turnMarker ?? DEFAULT_TURN_MARKER,
     });
     this.platformMemory.set(platformId, options?.memory ?? DEFAULT_MEMORY_CONFIG);
@@ -507,6 +509,7 @@ export class SessionManager extends EventEmitter {
       getPlatformOverhead: (pid) => this.platformOverhead.get(pid) ?? {
         sessionHeader: DEFAULT_OVERHEAD_VISIBILITY,
         stickyMessage: DEFAULT_OVERHEAD_VISIBILITY,
+        lifecycle: DEFAULT_OVERHEAD_VISIBILITY,
         turnMarker: DEFAULT_TURN_MARKER,
       },
 
@@ -1031,10 +1034,17 @@ export class SessionManager extends EventEmitter {
         const fmt = session.platform.getFormatter();
         const pauseMessage = `⏸️ ${fmt.formatBold('Platform disabled')} - session paused. Re-enable platform to resume.`;
 
-        // Update or create lifecycle post
+        // Update or create lifecycle post. The edit is ungated for the same
+        // reason as the shutdown path: it replaces a post the thread already
+        // has. Only the create is a new post and a new notification.
         if (session.lifecyclePostId) {
           await session.platform.updatePost(session.lifecyclePostId, pauseMessage);
-        } else {
+        } else if (
+          shouldPostLifecycle(
+            this.platformOverhead.get(session.platformId)?.lifecycle ?? DEFAULT_OVERHEAD_VISIBILITY,
+            'paused'
+          )
+        ) {
           const post = await session.platform.createPost(pauseMessage, session.threadId);
           session.lifecyclePostId = post.id;
         }
@@ -1879,9 +1889,16 @@ export class SessionManager extends EventEmitter {
         const shutdownMessage = `⏸️ ${fmt.formatBold('Bot shutting down')} - session will resume on restart`;
 
         if (session.lifecyclePostId) {
-          // Update existing timeout/warning post
+          // Update existing timeout/warning post. Ungated on purpose: editing
+          // a post the thread already has neither adds one nor notifies, and
+          // leaving a stale "session idle" up over a restart would be worse.
           await session.platform.updatePost(session.lifecyclePostId, shutdownMessage);
-        } else {
+        } else if (
+          shouldPostLifecycle(
+            this.platformOverhead.get(session.platformId)?.lifecycle ?? DEFAULT_OVERHEAD_VISIBILITY,
+            'shutdown'
+          )
+        ) {
           // Create new shutdown post and store the ID
           const post = await session.platform.createPost(shutdownMessage, session.threadId);
           session.lifecyclePostId = post.id;
