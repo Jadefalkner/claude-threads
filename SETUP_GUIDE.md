@@ -255,6 +255,10 @@ claude-threads --setup
 
 This will reload your existing config and let you update settings.
 
+### A note on the account the bot runs under
+
+Sessions use the MCP servers and plugins of the account the bot runs under, which is the point of running it on your own machine. The one exception is that account's claude.ai connectors (Gmail, Google Drive, Calendar, ...): those are disabled per session, so running the bot from your own laptop with your own login does not give the channel your mailbox. If you do want a platform's sessions to use them, set `claudeAiConnectors: true` on that platform, and keep in mind that everyone on its `allowedUsers` then gets them. See [MCP servers and claude.ai connectors](docs/CONFIGURATION.md#mcp-servers-and-claudeai-connectors-claudeaiconnectors-mcpservers-strictmcpconfig).
+
 ### Manual Configuration (Advanced)
 
 > **⚠️ Not recommended for first-time setup!**
@@ -361,14 +365,14 @@ platforms:
 ### General Issues
 
 #### "Claude CLI not found"
-- **Install** Claude Code CLI: `npm install -g @anthropic-ai/claude-code@2.1.251`
+- **Install** Claude Code CLI: `npm install -g @anthropic-ai/claude-code@2.1.263`
 - **Verify** it's in PATH: `which claude`
 - **Set** custom path if needed: `CLAUDE_PATH=/path/to/claude claude-threads`
 
 #### "Incompatible Claude CLI version" / "⚠️ untested"
 - **Check** your version: `claude --version`
 - The bot only refuses to start when the CLI is **too old** (below 2.0.74) or a **new major** (3.x+). A newer 2.x than the verified range runs normally with an "⚠️ untested" warning at startup and next to the version in the channel — install the latest verified version to clear it.
-- **Install** the latest verified version: `npm install -g @anthropic-ai/claude-code@2.1.251`
+- **Install** the latest verified version: `npm install -g @anthropic-ai/claude-code@2.1.263`
 - **Skip check** (not recommended): `claude-threads --skip-version-check`
 
 #### Can't find config file

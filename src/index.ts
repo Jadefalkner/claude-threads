@@ -13,6 +13,7 @@ import {
   resolveAuditLogEnabled,
   resolveRoutinesEnabled,
   resolveWatchesEnabled,
+  resolveBugReportsEnabled,
   resolveTranscriptionEnabled,
   isOverheadVisibility,
   OVERHEAD_VISIBILITY_VALUES,
@@ -21,6 +22,7 @@ import {
   type PlatformInstanceConfig,
   type PermissionMode,
   type OverheadVisibility,
+  resolvePlatformMcpPosture,
 } from './config/index.js';
 import type { CliArgs } from './config/index.js';
 import { runOnboarding } from './onboarding.js';
@@ -29,6 +31,7 @@ import { SessionManager } from './session/index.js';
 import { createTranscriber } from './transcription/index.js';
 import { SessionStore } from './persistence/session-store.js';
 import { configureAuditLog } from './persistence/audit-log.js';
+import { configureBugReports } from './operations/post-helpers/index.js';
 import { checkForUpdates } from './update-notifier.js';
 import { VERSION } from './version.js';
 import { keepAlive } from './utils/keep-alive.js';
@@ -75,6 +78,16 @@ function createPlatformClient(config: PlatformInstanceConfig): PlatformClient {
  */
 let activeDmRuntime: DmDiscoveryRuntime | undefined;
 
+/**
+ * Set once `main()` has built the graceful shutdown path. Module-level for the
+ * same reason `activeDmRuntime` is: `wirePlatformEvents` runs for platforms
+ * registered at runtime by DM auto-discovery, long after that loop would have
+ * run — wiring this per-client at startup would have left every derived DM
+ * platform emitting `reconnect-exhausted` to nobody, deaf and alive, which is
+ * the exact failure this feature exists to end.
+ */
+let onReconnectExhausted: ((platformId: string) => void) | undefined;
+
 function wirePlatformEvents(
   platformId: string,
   client: PlatformClient,
@@ -115,6 +128,22 @@ function wirePlatformEvents(
   client.on('error', (e) => {
     const message = e instanceof Error ? e.message : String(e);
     ui.addLog({ level: 'error', component: platformId, message });
+  });
+
+  // `reconnectPolicy: exit` — this platform has given up on its socket and
+  // wants the supervisor to restart us.
+  client.on('reconnect-exhausted', (id: string) => {
+    if (!onReconnectExhausted) {
+      // Before main() finished wiring there is nothing to shut down
+      // gracefully — but returning here would leave exactly the alive-and-deaf
+      // process the policy exists to prevent, so honour it the blunt way
+      // (Gemini review).
+      const msg = `Platform "${id}" exhausted reconnection during startup. Exiting.`;
+      ui.addLog({ level: 'error', component: '🔌', message: msg });
+      console.error(`\n${msg}\n`);
+      process.exit(1);
+    }
+    onReconnectExhausted(id);
   });
 }
 
@@ -370,6 +399,21 @@ async function startWithoutDaemon() {
     throw new Error('No platforms configured. Run with --setup to configure.');
   }
 
+  // MCP posture per platform (#560), resolved here, before the UI owns the
+  // screen and before any client exists: the top-level `mcpServers` merged
+  // with the platform's own, and the two booleans. A malformed server entry
+  // is a plain startup error with the field path, like a bad
+  // --permission-mode, not a throw from inside the platform loop. Derived DM
+  // instances spread these entries, so they inherit the validated values.
+  let mcpPostureWarnings: string[] = [];
+  try {
+    mcpPostureWarnings = resolvePlatformMcpPosture(newConfig.platforms, newConfig.mcpServers).warnings;
+  } catch (err) {
+    console.error(red(`  ❌ ${err instanceof Error ? err.message : String(err)}`));
+    process.exit(1);
+  }
+  for (const w of mcpPostureWarnings) console.warn(w);
+
   const config = newConfig;
 
   // Get the first platform's effective permission mode as the default
@@ -620,6 +664,11 @@ async function startWithoutDaemon() {
       },
     },
   });
+  // Startup warnings printed before Ink took the screen are easy to miss;
+  // repeat the MCP posture ones in the log panel.
+  for (const w of mcpPostureWarnings) {
+    ui.addLog({ level: 'warn', component: 'config', message: w });
+  }
 
   // Route all logger output through the UI
   setLogHandler((level, component, message, sessionId) => {
@@ -634,6 +683,8 @@ async function startWithoutDaemon() {
   // manager tracks all three modes correctly.
   const threadLogsEnabled = config.threadLogs?.enabled ?? true;
   const threadLogsRetentionDays = config.threadLogs?.retentionDays ?? 30;
+  const bugReportsEnabled = resolveBugReportsEnabled(config.bugReports);
+  configureBugReports(bugReportsEnabled);
   const session = new SessionManager(
     workingDir,
     initialPermissionMode,
@@ -645,7 +696,9 @@ async function startWithoutDaemon() {
     config.limits,  // Resource limits (optional, has sensible defaults)
     config.claudeAccounts,  // Claude account pool (undefined = single-account mode)
     config.respondOnlyWhenMentioned,  // Quiet-mode default for new sessions (#402)
-    config.userAttribution  // Per-message [@username]: attribution (default on; only applied once a thread has >1 participant)
+    config.userAttribution,  // Per-message [@username]: attribution (default on; only applied once a thread has >1 participant)
+    bugReportsEnabled,  // `!bug` files publicly; false removes the whole path
+    config.usage  // !usage output options (emails off unless turned on)
   );
 
   // Set sticky message customization from config
@@ -988,19 +1041,39 @@ async function startWithoutDaemon() {
   // Mark UI as ready
   ui.setReady();
 
-  const shutdown = async (_signal: string) => {
+  // One free /usage probe per account: does it have claude.ai connectors
+  // that sessions will not get (#560)? Logs and a sticky chip if so.
+  void session.noticeClaudeAiConnectors();
+
+  // The in-flight shutdown, so a second caller AWAITS it rather than getting
+  // an already-resolved promise and exiting mid-teardown. The old early
+  // `return` made `shutdown().finally(() => process.exit())` fire immediately
+  // on the second call — before persistence, before sessions were notified.
+  // Two platforms exhausting at once, or SIGINT then SIGTERM, both hit it
+  // (Codex review).
+  let shutdownInFlight: Promise<void> | null = null;
+
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shutdownInFlight) return shutdownInFlight;
+    shutdownInFlight = runShutdown(signal);
+    return shutdownInFlight;
+  };
+
+  const runShutdown = async (_signal: string) => {
     // Guard against multiple shutdown calls (SIGINT + SIGTERM)
     if (isShuttingDown) return;
     isShuttingDown = true;
+    // Set the shutdown flag before ANY await: a service manager that signals
+    // the whole process group (systemd KillMode=control-group) kills the
+    // agent children at the same instant, and their exit events must not be
+    // mistaken for resume failures while we are still yielding to React.
+    session.setShuttingDown();
 
     // Update status bar to show shutdown in progress
     ui.setShuttingDown();
 
     // Give React a moment to render the shutdown state
     await new Promise((resolve) => setTimeout(resolve, 50));
-
-    // Set shutdown flag FIRST to prevent race conditions with exit events
-    session.setShuttingDown();
 
     // Update sticky messages to show shutdown state
     await session.updateAllStickyMessages();
@@ -1035,6 +1108,20 @@ async function startWithoutDaemon() {
   triggerShutdown = () => {
     shutdown('Ctrl+C').finally(() => process.exit(0));
   };
+
+  // The decision to end the process belongs here, not in the platform class:
+  // the graceful path persists state, notifies active sessions and restores
+  // the terminal first. `shutdown()` guards against re-entry, so two platforms
+  // exhausting at once still runs it once.
+  onReconnectExhausted = (platformId: string) => {
+    const reason = `Platform "${platformId}" could not reconnect. Exiting so the supervisor can restart with a fresh socket (reconnectPolicy: exit).`;
+    ui.addLog({ level: 'error', component: '🔌', message: reason });
+    // Straight to stderr as well: the Ink UI renders asynchronously, so an
+    // interactive user would otherwise watch the screen clear with no reason.
+    console.error(`\n${reason}\n`);
+    shutdown(`reconnect-exhausted:${platformId}`).finally(() => process.exit(1));
+  };
+
 
   // Remove any existing signal handlers (e.g., from 'when-exit' package)
   // and register our own to ensure graceful shutdown

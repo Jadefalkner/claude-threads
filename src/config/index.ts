@@ -11,6 +11,7 @@ export type {
   ResolvedLimits,
   StickyMessageCustomization,
   ClaudeAccount,
+  UsageConfig,
   Config,
   PlatformInstanceConfig,
   MattermostPlatformConfig,
@@ -23,15 +24,25 @@ export type {
   PlatformOverhead,
   MemoryOption,
   ResolvedMemoryConfig,
+  McpServerConfig,
+  McpStdioServerConfig,
+  McpRemoteServerConfig,
 } from './types.js';
 export {
   DEFAULT_MEMORY_CONFIG,
   MEMORY_DISABLED,
   resolveMemoryConfig,
+  resolveMcpServers,
+  resolveStrictMcpConfig,
+  resolveClaudeAiConnectors,
+  isRemoteMcpServer,
+  validateMcpServers,
+  BOT_MCP_SERVER_NAME,
   resolveRoutinesEnabled,
   resolveTranscriptionEnabled,
   resolveWatchesEnabled,
   resolveAuditLogEnabled,
+  resolveBugReportsEnabled,
   LIMITS_DEFAULTS,
   resolveLimits,
   resolvePermissionMode,
@@ -42,6 +53,7 @@ export {
   DEFAULT_OVERHEAD_VISIBILITY,
   isOverheadVisibility,
   resolveOverheadVisibility,
+  resolveReconnectPolicy,
 } from './types.js';
 
 import type { Config, WorktreeMode as WorktreeModeType, PermissionMode, OverheadVisibility } from './types.js';
@@ -135,3 +147,5 @@ export interface CliArgs {
    */
   stickyMessage?: OverheadVisibility;
 }
+export { managedMcpConfigPath, managedMcpConfigPresent, MANAGED_MCP_CONFIG_PATHS } from './managed-mcp.js';
+export { resolvePlatformMcpPosture } from './mcp-posture.js';

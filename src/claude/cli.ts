@@ -1,4 +1,5 @@
 import { ChildProcess } from 'child_process';
+import { BOT_MCP_SERVER_NAME, isRemoteMcpServer, type McpServerConfig } from '../config/types.js';
 import { crossSpawn } from '../utils/spawn.js';
 import { EventEmitter } from 'events';
 import { resolve, dirname } from 'path';
@@ -95,6 +96,22 @@ export interface PlatformMcpConfig {
    * config. When omitted the bot defaults to enabled with 100MB cap.
    */
   outboundFiles?: { enabled?: boolean; maxBytes?: number };
+  /**
+   * Operator-declared MCP servers (config.yaml `mcpServers`, already
+   * validated) that ride in the same `--mcp-config` blob as the bot's own.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Opt-in: pass `--strict-mcp-config` so the CLI ignores every MCP source
+   * but that blob (user-level servers, plugin servers, the repo's .mcp.json).
+   */
+  strictMcpConfig?: boolean;
+  /**
+   * Let the account's claude.ai connectors into the session. Default
+   * (undefined/false) disables them through `disableClaudeAiConnectors` in
+   * the inline settings (#560).
+   */
+  claudeAiConnectors?: boolean;
 }
 
 export interface ClaudeCliOptions {
@@ -204,9 +221,20 @@ export interface ClaudeCliAccount {
 export function buildClaudeChildEnv(
   parentEnv: NodeJS.ProcessEnv,
   account?: ClaudeCliAccount,
-  opts?: { decisionBridge?: boolean; disableAutoMemory?: boolean }
+  opts?: { decisionBridge?: boolean; disableAutoMemory?: boolean; claudeAiConnectors?: boolean }
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...parentEnv };
+
+  // The account's claude.ai connectors (Gmail, Drive, Calendar, ...) stay out
+  // of every child unless the caller opted in (#560). The env var is the
+  // CLI's older kill switch for the same thing as the `disableClaudeAiConnectors`
+  // setting: verified on 2.1.112, where the setting does not exist yet, and
+  // on 2.1.263, where both work. Like the memory switch it deliberately
+  // overrides the parent env: a privacy measure, not tuning. Sessions get
+  // the setting as well (buildInlineSettings); one-shots rely on this alone.
+  if (opts?.claudeAiConnectors !== true) {
+    env.ENABLE_CLAUDEAI_MCP_SERVERS = 'false';
+  }
 
   // Always-on tuning flags (opt-out by setting them in the parent env).
   if (env.MCP_CONNECTION_NONBLOCKING === undefined) {
@@ -284,8 +312,20 @@ export function buildClaudeChildEnv(
 export function buildInlineSettings(
   statusLineCommand: string | undefined,
   memory: ClaudeCliOptions['memory'],
+  mcp: { claudeAiConnectors?: boolean } = {},
 ): Record<string, unknown> | null {
   const settings: Record<string, unknown> = {};
+  // The account's claude.ai connectors (Gmail, Drive, Calendar, ...) stay out
+  // of the session unless the platform opted in. This is the narrow switch:
+  // it leaves user-level servers, plugin servers and the repo's .mcp.json
+  // alone, which --strict-mcp-config would not. Verified on 2.1.251 and
+  // 2.1.263 (the connectors vanish, a plugin's server stays); the key is
+  // absent on 2.1.112 and older, where the ENABLE_CLAUDEAI_MCP_SERVERS env
+  // var set by buildClaudeChildEnv does the same job. The events handler
+  // still warns if connectors show up in system/init regardless.
+  if (mcp.claudeAiConnectors !== true) {
+    settings.disableClaudeAiConnectors = true;
+  }
   if (statusLineCommand) {
     settings.statusLine = {
       type: 'command',
@@ -330,13 +370,12 @@ function isErrorResultEvent(event: ClaudeEvent): boolean {
 /**
  * Shape of an MCP `--mcp-config` blob for the Claude CLI. Exported for tests.
  */
+export type McpBlobServer =
+  | { type: 'stdio'; command: string; args: string[]; env: Record<string, string> }
+  | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> };
+
 export interface McpConfigBlob {
-  mcpServers: Record<string, {
-    type: 'stdio';
-    command: string;
-    args: string[];
-    env: Record<string, string>;
-  }>;
+  mcpServers: Record<string, McpBlobServer>;
 }
 
 /**
@@ -486,6 +525,17 @@ export function buildPermissionArgs(opts: {
     },
   };
 
+  // Operator-declared servers ride in the same blob (so their env/headers
+  // stay off argv too). The bot's own name is reserved: the config loader
+  // refuses it, and this guard keeps any caller that bypasses the loader
+  // from swapping out the permission server.
+  for (const [name, server] of Object.entries(opts.platformConfig.mcpServers ?? {})) {
+    if (name === BOT_MCP_SERVER_NAME) continue;
+    mcpConfig.mcpServers[name] = isRemoteMcpServer(server)
+      ? { type: server.type, url: server.url, ...(server.headers ? { headers: server.headers } : {}) }
+      : { type: 'stdio', command: server.command, args: server.args ?? [], env: server.env ?? {} };
+  }
+
   const materialized = materializeMcpConfig(mcpConfig, opts.sessionId, { inline: opts.inline });
   let tempFile: string | null = null;
   if (materialized.mode === 'file') {
@@ -493,6 +543,15 @@ export function buildPermissionArgs(opts: {
     args.push('--mcp-config', materialized.path);
   } else {
     args.push('--mcp-config', materialized.value);
+  }
+
+  // Opt-in hardening: only the servers in that blob. The flag also drops
+  // user-level servers, servers bundled with plugins and the repo's
+  // .mcp.json (verified on 2.1.263 with a --plugin-dir probe), which is why
+  // it is not the default; the connectors alone are handled through the
+  // inline settings (see buildInlineSettings). Exists on 2.0.74, the floor.
+  if (opts.platformConfig.strictMcpConfig === true) {
+    args.push('--strict-mcp-config');
   }
 
   // Mode-specific flags:
@@ -699,7 +758,9 @@ export class ClaudeCli extends EventEmitter {
       const runtime = runtimeForScriptPath(statusLineWriterPath);
       statusLineCommand = `${runtime} ${statusLineWriterPath} ${this.options.sessionId}`;
     }
-    const settings = buildInlineSettings(statusLineCommand, this.options.memory);
+    const settings = buildInlineSettings(statusLineCommand, this.options.memory, {
+      claudeAiConnectors: this.options.platformConfig?.claudeAiConnectors,
+    });
     if (settings) {
       args.push('--settings', JSON.stringify(settings));
     }
@@ -1101,6 +1162,7 @@ export class ClaudeCli extends EventEmitter {
    */
   private buildChildEnv(): NodeJS.ProcessEnv {
     return buildClaudeChildEnv(process.env, this.options.account, {
+      claudeAiConnectors: this.options.platformConfig?.claudeAiConnectors,
       decisionBridge: this.options.decisionBridgePath !== undefined,
       disableAutoMemory: this.options.memory === null,
     });

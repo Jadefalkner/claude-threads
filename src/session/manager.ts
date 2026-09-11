@@ -19,7 +19,7 @@ import type { PlatformClient, PlatformUser, PlatformPost, PlatformFile } from '.
 import { SessionStore, PersistedSession, PersistedContextPrompt } from '../persistence/session-store.js';
 import type { PersistedTrackedTask } from '../operations/task-tracker.js';
 import { GitHubEmailsStore } from '../persistence/github-emails-store.js';
-import { WorktreeMode, type LimitsConfig, type ResolvedLimits, type ClaudeAccount, type PermissionMode, type OverheadVisibility, type PlatformOverhead, type ResolvedMemoryConfig, DEFAULT_OVERHEAD_VISIBILITY, DEFAULT_MEMORY_CONFIG, resolveLimits, effectivePermissionMode } from '../config/index.js';
+import { WorktreeMode, type LimitsConfig, type ResolvedLimits, type ClaudeAccount, type UsageConfig, type PermissionMode, type OverheadVisibility, type PlatformOverhead, type ResolvedMemoryConfig, DEFAULT_OVERHEAD_VISIBILITY, DEFAULT_MEMORY_CONFIG, resolveLimits, effectivePermissionMode } from '../config/index.js';
 import { MemoryStore } from '../memory/store.js';
 import { RoutinesStore, type Routine, type RoutineRunStatus } from '../persistence/routines-store.js';
 import { WatchesStore } from '../persistence/watches-store.js';
@@ -29,6 +29,7 @@ import { RoutineScheduler } from '../routines/scheduler.js';
 import { fireRoutine } from '../routines/runner.js';
 import { AccountPool } from '../claude/account-pool.js';
 import { probeAccountUsage } from '../claude/usage-probe.js';
+import { probeClaudeAiConnectors } from '../claude/connector-probe.js';
 import type { SessionInfo } from '../ui/types.js';
 import { CleanupScheduler } from '../cleanup/index.js';
 import { SessionMonitor } from '../operations/monitor/index.js';
@@ -104,6 +105,9 @@ export class SessionManager extends EventEmitter {
   /** Config default for per-message `[@username]:` attribution on new sessions. */
   private userAttribution: boolean;
   private threadLogsEnabled: boolean;
+  /** Top-level `bugReports`; false removes the whole `!bug` path. */
+  private bugReportsEnabled: boolean;
+  private usageShowEmails: boolean;
   private threadLogsRetentionDays: number;
   // Resolved limits configuration
   private readonly limits: ResolvedLimits;
@@ -160,6 +164,8 @@ export class SessionManager extends EventEmitter {
 
   // Claude account pool (single-account mode when empty)
   private readonly accountPool: AccountPool;
+  /** Connectors the account has but sessions do not get; set by noticeClaudeAiConnectors. */
+  private connectorsOff: number | null = null;
   // On-demand /usage probe coalescing: the in-flight cycle (shared by concurrent
   // session starts) and the epoch ms it last completed (for the TTL skip).
   private usageRefreshInFlight: Promise<void> | null = null;
@@ -183,7 +189,9 @@ export class SessionManager extends EventEmitter {
     limits?: LimitsConfig,
     claudeAccounts?: ClaudeAccount[],
     respondOnlyWhenMentioned = false,
-    userAttribution = true
+    userAttribution = true,
+    bugReportsEnabled = true,
+    usage?: UsageConfig
   ) {
     super();
     this.workingDir = workingDir;
@@ -195,6 +203,7 @@ export class SessionManager extends EventEmitter {
     this.worktreeMode = worktreeMode;
     this.respondOnlyWhenMentioned = respondOnlyWhenMentioned;
     this.userAttribution = userAttribution;
+    this.bugReportsEnabled = bugReportsEnabled;
     this.threadLogsEnabled = threadLogsEnabled;
     this.threadLogsRetentionDays = threadLogsRetentionDays;
     this.limits = resolveLimits(limits);
@@ -205,6 +214,7 @@ export class SessionManager extends EventEmitter {
     this.watchesStore = new WatchesStore();
     this.registry = new SessionRegistry(this.sessionStore);
     this.accountPool = new AccountPool(claudeAccounts);
+    this.usageShowEmails = usage?.showEmails ?? false;
 
     // Create background tasks (started in initialize())
     this.sessionMonitor = new SessionMonitor({
@@ -408,6 +418,7 @@ export class SessionManager extends EventEmitter {
       threadLogsRetentionDays: this.threadLogsRetentionDays,
       permissionTimeoutMs: this.limits.permissionTimeoutSeconds * 1000,
       flushDelayMs: this.limits.flushDelayMs,
+      bugReportsEnabled: this.bugReportsEnabled,
     };
 
     const state: SessionState = {
@@ -429,6 +440,7 @@ export class SessionManager extends EventEmitter {
 
       // Post management
       registerPost: (pid, tid) => this.registerPost(pid, tid),
+      beginInteractivePost: (tid) => this.registry.beginInteractivePost(tid),
 
       // Streaming & content (inlined - no wrapper methods needed)
       flush: async (s) => {
@@ -471,7 +483,8 @@ export class SessionManager extends EventEmitter {
       deferUpdate: (min) => this.autoUpdateManager?.deferUpdate(min),
 
       // Bug report operations
-      handleBugReportApproval: (s, approved, user) => commands.handleBugReportApproval(s, approved, user),
+      handleBugReportApproval: (s, approved, user) =>
+        commands.handleBugReportApproval(s, approved, user, this.getContext()),
 
       // Context prompt (inlined - no wrapper method needed)
       offerContextPrompt: (s, q, f, e, sender, autoInclude) => contextPrompt.offerContextPrompt(s, q, f, this.getContextPromptHandler(), e, sender, autoInclude),
@@ -874,9 +887,46 @@ export class SessionManager extends EventEmitter {
         description: this.customDescription,
         footer: this.customFooter,
         accountPoolStatus: this.accountPool.isEmpty ? undefined : this.accountPool.status(),
+        connectorsOff: this.connectorsOff ?? undefined,
       },
       overheadByPlatform,
     );
+  }
+
+  /**
+   * Find out, once, whether the bot's account(s) have claude.ai connectors
+   * that sessions will not get (#560), and say so where an operator looks:
+   * the log at startup, and a chip in the channel sticky. Stays quiet when a
+   * platform opted in with `claudeAiConnectors: true`, when no account has
+   * any, or when the probe could not tell. Never throws; fire-and-forget.
+   */
+  async noticeClaudeAiConnectors(): Promise<void> {
+    try {
+      const accounts: Array<ClaudeAccount | undefined> = this.accountPool.isEmpty ? [undefined] : [...this.accountPool.all];
+      const found = new Set<string>();
+      await Promise.all(accounts.map(async (acc) => {
+        const names = await probeClaudeAiConnectors(acc);
+        for (const n of names ?? []) found.add(n);
+      }));
+      if (found.size === 0) return;
+      const allowedOn = [...this.platforms.entries()]
+        .filter(([, client]) => client.getMcpConfig().claudeAiConnectors === true)
+        .map(([id]) => id);
+      const names = [...found].sort().join(', ');
+      if (allowedOn.length > 0) {
+        log.info(`claude.ai connectors (${names}) are available to sessions on: ${allowedOn.join(', ')}`);
+        return;
+      }
+      log.warn(
+        `This Claude account has claude.ai connectors (${names}). Sessions do not get them: ` +
+        `since 1.35.0 the bot disables them per session. To let a platform's sessions use them, set ` +
+        `claudeAiConnectors: true on that platform in config.yaml (everyone on its allowedUsers gets them).`,
+      );
+      this.connectorsOff = found.size;
+      await this.updateAllStickyMessages();
+    } catch (err) {
+      log.debug(`Connector notice skipped: ${err}`);
+    }
   }
 
   /**
@@ -1049,7 +1099,7 @@ export class SessionManager extends EventEmitter {
 
     for (const state of sessionsToResume) {
       try {
-        await lifecycle.resumeSession(state, this.getContext());
+        await lifecycle.resumeSession(state, this.getContext(), undefined, 'platform-enabled');
         log.info(`▶️ Resumed session ${state.threadId.substring(0, 8)}`);
       } catch (err) {
         log.warn(`Failed to resume session ${state.threadId}: ${err}`);
@@ -1204,7 +1254,7 @@ export class SessionManager extends EventEmitter {
       if (activeToResume.length > 0) {
         log.info(`🔄 Attempting to resume ${activeToResume.length} active session(s)...`);
         for (const state of activeToResume) {
-          await lifecycle.resumeSession(state, this.getContext());
+          await lifecycle.resumeSession(state, this.getContext(), undefined, 'boot');
         }
       }
     }
@@ -1272,6 +1322,22 @@ export class SessionManager extends EventEmitter {
 
   async resumePausedSession(threadId: string, message: string, files: PlatformFile[] | undefined, username: string, platformId: string): Promise<void> {
     await lifecycle.resumePausedSession(threadId, message, files, this.getContext(), username, platformId);
+  }
+
+  /**
+   * The configured Claude account pool; empty in single-account mode. Exposed
+   * so `!usage` reports the same seats the router is choosing between.
+   */
+  /** Whether `!usage` may print seat email addresses. Off unless configured. */
+  getUsageShowEmails(): boolean {
+    return this.usageShowEmails;
+  }
+
+  getClaudeAccounts(): readonly ClaudeAccount[] {
+    // The pool's own normalized list, not the raw constructor input: the two
+    // must enumerate identically or `!usage` reports seats the router does not
+    // use. Readonly so a caller cannot mutate what the router is reading.
+    return this.accountPool.all;
   }
 
   getPersistedSession(threadId: string, platformId?: string): PersistedSession | undefined {
@@ -1487,6 +1553,11 @@ export class SessionManager extends EventEmitter {
    */
   async enableInteractivePermissions(threadId: string, username: string): Promise<void> {
     await this.setSessionPermissionMode(threadId, username, 'default');
+  }
+
+  /** Whether `!bug` may file a report; see resolveBugReportsEnabled. */
+  getBugReportsEnabled(): boolean {
+    return this.bugReportsEnabled;
   }
 
   async reportBug(threadId: string, description: string | undefined, username: string, files?: PlatformFile[]): Promise<void> {

@@ -393,6 +393,7 @@ describe('materializeMcpConfig', () => {
     if (result.mode !== 'file') throw new Error('expected file mode');
     const parsed = JSON.parse(readFileSync(result.path, 'utf8')) as McpConfigBlob;
     const server = parsed.mcpServers['claude-threads-mcp'];
+    if (server.type !== 'stdio') throw new Error('expected the bot server to be stdio');
     expect(server.env.PLATFORM_TOKEN).toBe('SECRET-TOKEN');
     rmSync(result.path);
   });
@@ -479,6 +480,74 @@ describe('buildPermissionArgs', () => {
     expect(args).toContain('mcp__claude-threads-mcp__permission_prompt');
     expect(args).not.toContain('--permission-mode');
     expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  // -------------------------------------------------------------------------
+  // MCP server scope (#560): strict by default, operator servers in the blob
+  // -------------------------------------------------------------------------
+  const blobOf = (args: string[]): McpConfigBlob =>
+    JSON.parse(args[args.indexOf('--mcp-config') + 1]) as McpConfigBlob;
+
+  it('does not pass --strict-mcp-config by default (user-level, plugin and .mcp.json servers stay)', () => {
+    const { args } = buildPermissionArgs({ ...baseOpts, permissionMode: 'default' });
+    expect(args).not.toContain('--strict-mcp-config');
+    const { args: bypassArgs } = buildPermissionArgs({ ...baseOpts, permissionMode: 'bypass' });
+    expect(bypassArgs).not.toContain('--strict-mcp-config');
+  });
+
+  it('strictMcpConfig: true passes the flag, in default and bypass mode alike', () => {
+    for (const permissionMode of ['default', 'bypass'] as const) {
+      const { args } = buildPermissionArgs({
+        ...baseOpts,
+        permissionMode,
+        platformConfig: { ...baseOpts.platformConfig, strictMcpConfig: true },
+      });
+      expect(args).toContain('--strict-mcp-config');
+    }
+  });
+
+  it('declared stdio servers ride in the blob, normalized, with their env off argv', () => {
+    const { args } = buildPermissionArgs({
+      ...baseOpts,
+      permissionMode: 'default',
+      platformConfig: {
+        ...baseOpts.platformConfig,
+        mcpServers: { github: { command: 'npx', args: ['-y', 'gh-mcp'], env: { GITHUB_TOKEN: 'SECRET-GH' } }, bare: { command: 'my-mcp' } },
+      },
+    });
+    const blob = blobOf(args);
+    expect(blob.mcpServers.github).toEqual({ type: 'stdio', command: 'npx', args: ['-y', 'gh-mcp'], env: { GITHUB_TOKEN: 'SECRET-GH' } });
+    expect(blob.mcpServers.bare).toEqual({ type: 'stdio', command: 'my-mcp', args: [], env: {} });
+    expect(blob.mcpServers['claude-threads-mcp']).toBeDefined();
+    const argvWithoutBlob = args.filter((_, i) => args[i - 1] !== '--mcp-config');
+    expect(argvWithoutBlob.join(' ')).not.toContain('SECRET-GH');
+  });
+
+  it('declared remote servers pass through with their headers', () => {
+    const { args } = buildPermissionArgs({
+      ...baseOpts,
+      permissionMode: 'default',
+      platformConfig: {
+        ...baseOpts.platformConfig,
+        mcpServers: { docs: { type: 'http', url: 'https://mcp.example.test/', headers: { Authorization: 'Bearer x' } } },
+      },
+    });
+    expect(blobOf(args).mcpServers.docs).toEqual({ type: 'http', url: 'https://mcp.example.test/', headers: { Authorization: 'Bearer x' } });
+  });
+
+  it("a declared server cannot replace the bot's own permission server", () => {
+    const { args } = buildPermissionArgs({
+      ...baseOpts,
+      permissionMode: 'default',
+      platformConfig: {
+        ...baseOpts.platformConfig,
+        mcpServers: { 'claude-threads-mcp': { command: '/evil/server' } },
+      },
+    });
+    const bot = blobOf(args).mcpServers['claude-threads-mcp'];
+    if (bot.type !== 'stdio') throw new Error('expected stdio');
+    expect(bot.command).not.toBe('/evil/server');
+    expect(bot.args).toEqual(['/path/to/mcp-server.js']);
   });
 
   it('runs a built .js MCP server under node', () => {
@@ -867,9 +936,26 @@ describe('rate-limit emit guard - suppressed explicit hit keeps its explicitness
   });
 });
 
+describe('buildInlineSettings (claude.ai connectors, #560)', () => {
+  it('disables the claude.ai connectors by default, even with nothing else to set', () => {
+    expect(buildInlineSettings(undefined, null)).toEqual({ disableClaudeAiConnectors: true });
+    expect(buildInlineSettings(undefined, null, {})).toEqual({ disableClaudeAiConnectors: true });
+    expect(buildInlineSettings(undefined, null, { claudeAiConnectors: false })).toEqual({ disableClaudeAiConnectors: true });
+  });
+
+  it('leaves the connectors alone when the platform opted in', () => {
+    expect(buildInlineSettings(undefined, null, { claudeAiConnectors: true })).toBeNull();
+    const withMemory = buildInlineSettings(undefined, { autoMemoryDir: '/mem' }, { claudeAiConnectors: true })!;
+    expect(withMemory.disableClaudeAiConnectors).toBeUndefined();
+    expect(withMemory.autoMemoryDirectory).toBe('/mem');
+  });
+});
+
 describe('buildInlineSettings (memory + statusLine)', () => {
-  test('returns null when nothing needs settings (pre-memory behavior preserved)', () => {
-    expect(buildInlineSettings(undefined, null)).toBeNull();
+  test('returns null when nothing needs settings (connectors opted in, no memory, no statusLine)', () => {
+    // Without the opt-in the connectors kill switch alone yields a settings
+    // object; see the #560 block above.
+    expect(buildInlineSettings(undefined, null, { claudeAiConnectors: true })).toBeNull();
   });
 
   test('statusLine only when no memory', () => {
@@ -890,6 +976,19 @@ describe('buildInlineSettings (memory + statusLine)', () => {
     const settings = buildInlineSettings('node w.js s1', { autoMemoryDir: '/mem/dir' })!;
     expect(settings.statusLine).toBeDefined();
     expect(settings.autoMemoryDirectory).toBe('/mem/dir');
+  });
+});
+
+describe('buildClaudeChildEnv: claude.ai connectors kill switch (#560)', () => {
+  test('sets ENABLE_CLAUDEAI_MCP_SERVERS=false by default, overriding the parent env', () => {
+    expect(buildClaudeChildEnv({}, undefined).ENABLE_CLAUDEAI_MCP_SERVERS).toBe('false');
+    expect(buildClaudeChildEnv({ ENABLE_CLAUDEAI_MCP_SERVERS: 'true' }, undefined, {}).ENABLE_CLAUDEAI_MCP_SERVERS).toBe('false');
+    expect(buildClaudeChildEnv({}, undefined, { claudeAiConnectors: false }).ENABLE_CLAUDEAI_MCP_SERVERS).toBe('false');
+  });
+
+  test('leaves the env alone when the platform opted in', () => {
+    expect(buildClaudeChildEnv({}, undefined, { claudeAiConnectors: true }).ENABLE_CLAUDEAI_MCP_SERVERS).toBeUndefined();
+    expect(buildClaudeChildEnv({ ENABLE_CLAUDEAI_MCP_SERVERS: 'true' }, undefined, { claudeAiConnectors: true }).ENABLE_CLAUDEAI_MCP_SERVERS).toBe('true');
   });
 });
 

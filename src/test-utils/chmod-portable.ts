@@ -12,8 +12,8 @@
  * This helper:
  *   1. Tries `fs.chmod` (works on Node, may silently strip on Bun).
  *   2. Verifies the result via `fs.stat`.
- *   3. If the requested mode bits didn't land, shells out to `/bin/chmod`
- *      (which goes through the kernel directly, bypassing the runtime).
+ *   3. If the requested mode bits didn't land, shells out to `chmod` from
+ *      `PATH` (which goes through the kernel directly, bypassing the runtime).
  *   4. If THAT also fails, throws so the test fails noisily — better a red
  *      test than a silent green that's testing nothing.
  *
@@ -41,14 +41,15 @@ export async function setMode(path: string, mode: FileMode): Promise<void> {
   }
 
   // Step 2: shell out as a last resort. Use the absolute octal form so we
-  // don't depend on the symbolic parser of /bin/chmod.
+  // don't depend on the symbolic parser of chmod. Resolve it via PATH:
+  // NixOS has no /bin/chmod (only /run/current-system/sw/bin/chmod).
   const octal = (mode & 0o7777).toString(8).padStart(4, '0');
-  execFileSync('/bin/chmod', [octal, path]);
+  execFileSync('chmod', [octal, path]);
   s = await stat(path);
   if ((s.mode & 0o7777) !== (mode & 0o7777)) {
     throw new Error(
       `setMode(${path}, ${octal}) failed: stat shows ${(s.mode & 0o7777).toString(8)}. ` +
-        `Runtime chmod is broken AND /bin/chmod did not stick — bailing rather than running a useless test.`,
+        `Runtime chmod is broken AND chmod did not stick — bailing rather than running a useless test.`,
     );
   }
 }

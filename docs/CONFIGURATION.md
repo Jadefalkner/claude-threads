@@ -24,6 +24,12 @@ platforms:
     allowedUsers: [alice, bob]
     permissionMode: default
     memory: true                  # persistent memory (default on; see Memory below)
+    claudeAiConnectors: false     # keep the account's Gmail/Drive/Calendar out of sessions (default; see MCP servers below)
+    mcpServers:                   # extra MCP servers for this platform's sessions
+      github:
+        command: npx
+        args: [-y, "@modelcontextprotocol/server-github"]
+        env: { GITHUB_TOKEN: ghp-your-token }
 
   # Slack
   - id: slack-eng
@@ -48,10 +54,13 @@ platforms:
 | `respondOnlyWhenMentioned` | Start new threads in quiet mode, where the bot only replies to messages that @mention it. Users can still toggle per-thread with `!mentions`. | `false` |
 | `userAttribution` | Prefix each user turn sent to Claude with the sender's `[@username]:` so Claude can tell who is speaking in multi-user threads. Only applied once a thread has more than one participant (after `!invite`); solo threads are left untouched. Set `false` to disable. Applies to new sessions. | `true` |
 | `keepAlive` | Prevent system sleep while sessions are active | `true` |
+| `bugReports` | Whether `!bug` may file a report. ⚠️ A bug report leaves your infrastructure: attached screenshots are uploaded to a public anonymous file host, and the report body — session context plus recent daemon log lines — is filed as an issue on the project's public GitHub repository, behind best-effort redaction. Claude can also invoke `!bug` itself. Set `false` and the whole path is removed: the command is refused, Claude cannot invoke it either, the 🐛 error reaction does nothing, the approval that would file the issue is refused, and `!bug` disappears from `!help`. **Fails closed** — a malformed value disables it rather than defaulting to on. | `true` |
 | `limits` | Resource limits and timeouts (see below) | see below |
 | `threadLogs` | Thread logging (see below) | enabled |
 | `stickyMessage` | Sticky message text customization (see below) | none |
 | `claudeAccounts` | Multi-account pool (see below) | single-account mode |
+| `mcpServers` | MCP servers every platform's sessions get, on top of the bot's own (see [MCP servers and claude.ai connectors](#mcp-servers-and-claudeai-connectors-claudeaiconnectors-mcpservers-strictmcpconfig)) | none |
+| `usage.showEmails` | Print each seat's login email in `!usage` output | `false` |
 
 ### Resource Limits (`limits`)
 
@@ -165,6 +174,7 @@ What happens: every `audio/*` attachment (or a file with an audio extension when
 | `directChannelMode` | No | Direct channel mode: the whole channel is one session, and the bot replies with top-level channel posts instead of thread replies. `true` for defaults, or an options object (`respondTo`). See [Direct Channel Mode](#direct-channel-mode). |
 | `approvals` | No | Who may answer tool-permission prompts and other reaction gates: `owner` (session participants) or `all_users` (everyone on `allowedUsers`). Unset keeps the historical default per mode — `all_users` for thread sessions, `owner` for direct channel mode. See [Approvals](#approvals). |
 | `ackReaction` | No | Read receipt: react to every accepted message (session start, follow-up, resume) the instant it is accepted, before Claude produces output. `true` uses 👀 (`eyes`), a string names a custom emoji. Persistent, unlike the typing indicator — useful in busy channels and for messages queued behind an in-flight session start. The receipt means *accepted*, not *delivered*: a later failure (capacity limit, Claude not coming up) is still reported by its own post. `!commands` are not acked — they have their own immediate feedback, and neither are messages accepted through the message-approval flow (an authorized user approving a non-participant's message) — there the approval reaction is already the visible signal. Note: in direct channel mode this is one reaction API call per accepted message. Default off. |
+| `reconnectPolicy` | No | What happens when reconnection attempts run out: `retry` (default — log, cool down 60s, reset the counter and keep trying; recovers with no supervisor) or `exit` (leave through the graceful shutdown path and exit non-zero, for `Restart=always` deployments). The bot never stays alive with a dead socket either way. |
 | `auditLog` | No | Append-only audit trail of what the bot executed for this platform — tool calls (incl. subagents), session lifecycle, security-relevant commands, plan approvals. One JSONL stream per platform under `~/.claude-threads/audit/` (override: `CLAUDE_THREADS_AUDIT_DIR`), files `0600`. The bot never deletes it — rotation/retention is the operator's job (logrotate, SIEM ingestion). See [Audit log](#audit-log). Default off. |
 | `directMessages` | No | Mattermost only: DM auto-discovery. A direct message from a user on `allowedUsers` spawns a derived direct-channel-mode instance for that DM conversation — no per-DM entry needed. See [DM auto-discovery](#dm-auto-discovery). |
 
@@ -188,6 +198,7 @@ What happens: every `audio/*` attachment (or a file with an audio extension when
 | `directChannelMode` | No | Direct channel mode: the whole channel is one session, and the bot replies with top-level channel posts instead of thread replies. `true` for defaults, or an options object (`respondTo`). See [Direct Channel Mode](#direct-channel-mode). |
 | `approvals` | No | Who may answer tool-permission prompts and other reaction gates: `owner` (session participants) or `all_users` (everyone on `allowedUsers`). Unset keeps the historical default per mode — `all_users` for thread sessions, `owner` for direct channel mode. See [Approvals](#approvals). |
 | `ackReaction` | No | Read receipt: react to every accepted message (session start, follow-up, resume) the instant it is accepted, before Claude produces output. `true` uses 👀 (`eyes`), a string names a custom emoji. Persistent, unlike the typing indicator — useful in busy channels and for messages queued behind an in-flight session start. The receipt means *accepted*, not *delivered*: a later failure (capacity limit, Claude not coming up) is still reported by its own post. `!commands` are not acked — they have their own immediate feedback, and neither are messages accepted through the message-approval flow (an authorized user approving a non-participant's message) — there the approval reaction is already the visible signal. Note: in direct channel mode this is one reaction API call per accepted message. Default off. |
+| `reconnectPolicy` | No | What happens when reconnection attempts run out: `retry` (default — log, cool down 60s, reset the counter and keep trying; recovers with no supervisor) or `exit` (leave through the graceful shutdown path and exit non-zero, for `Restart=always` deployments). The bot never stays alive with a dead socket either way. |
 | `auditLog` | No | Append-only audit trail of what the bot executed for this platform — tool calls (incl. subagents), session lifecycle, security-relevant commands, plan approvals. One JSONL stream per platform under `~/.claude-threads/audit/` (override: `CLAUDE_THREADS_AUDIT_DIR`), files `0600`. The bot never deletes it — rotation/retention is the operator's job (logrotate, SIEM ingestion). See [Audit log](#audit-log). Default off. |
 
 ### Direct Channel Mode
@@ -297,6 +308,51 @@ The `permissionMode` field controls how the bot handles a session's tool-use req
 | `bypass` | No prompts and no classifier. Every tool-use is allowed. Equivalent to `--dangerously-skip-permissions`. This is what the legacy `skipPermissions: true` maps to. |
 
 A running session can switch mode at any time with `!permissions <mode>`; that override is not persisted across a bot restart.
+
+### MCP servers and claude.ai connectors (`claudeAiConnectors`, `mcpServers`, `strictMcpConfig`)
+
+Sessions run with the MCP servers the machine already has, as the README promises: the user-level servers of the account the bot runs under, servers bundled with installed plugins, and any `.mcp.json` in the working directory, plus the bot's own permission server. One thing is excluded by default: the account's **claude.ai connectors** (Gmail, Google Drive, Google Calendar, ...). A bot run under a personal account used to hand every session in the channel that person's mailbox; anyone on `allowedUsers` could ask for it, and a message let through by the approval flow or a watch firing on channel content could reach it without anyone meaning to. The bot now passes `disableClaudeAiConnectors` in the CLI's inline settings, which drops exactly those and nothing else.
+
+| Setting (per platform) | Default | Effect |
+|---|---|---|
+| `claudeAiConnectors` | `false` | `true` lets the account's claude.ai connectors into this platform's sessions. Only for a platform whose users may act as that account. Done two ways: the `disableClaudeAiConnectors` setting (present from 2.1.251, verified there and on 2.1.263) and the `ENABLE_CLAUDEAI_MCP_SERVERS=false` env var on every child, which also covers older CLIs (verified on 2.1.112). Should connectors show up anyway, the session posts a warning in the thread. |
+| `mcpServers` | none | Extra servers for this platform's sessions, merged over the top-level `mcpServers` (the platform wins on a name clash). See below. |
+| `strictMcpConfig` | `false` | `true` passes `--strict-mcp-config`: the session gets only the bot's own blob (its permission server plus `mcpServers`) and nothing from the account, plugins or the repo. Opt-in hardening for a channel that should see exactly the declared set. |
+
+Declaring servers, at the top level for every platform or per platform:
+
+```yaml
+mcpServers:                       # top level: every platform
+  docs:
+    type: http                    # or sse
+    url: https://mcp.example.com/
+    headers: { Authorization: "Bearer ..." }
+
+platforms:
+  - id: mattermost-main
+    # ... credentials ...
+    mcpServers:                   # this platform only
+      github:
+        command: npx              # stdio server: command, optional args and env
+        args: [-y, "@modelcontextprotocol/server-github"]
+        env: { GITHUB_TOKEN: ghp-your-token }
+```
+
+A stdio server needs `command` (with optional `args` and `env`); a remote one needs `type: http` or `type: sse` and a `url` (with optional `headers`). Keys outside those are rejected, as is an entry with both `command` and `url`. The name `claude-threads-mcp` is reserved for the bot's own server. A malformed entry stops the bot at startup with the field path in the message, rather than dropping the server silently. Secrets in `env` and `headers` travel in the same owner-only tempfile as the bot's platform token, never on the command line.
+
+Three things to know about stdio servers:
+
+- The CLI expands `${VAR}` in `args` and `env` from its own environment (verified on 2.1.263), so `env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" }` keeps the token out of `config.yaml`. With a Claude account pool that environment is the pooled account's (`HOME` is overridden per session).
+- A declared server inherits the CLI's environment, including `ANTHROPIC_API_KEY` when the session runs on an API-key pool account. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` (see Environment Variables) makes the CLI strip those credentials from the servers it spawns.
+- On Windows, `npx` and other `.cmd` shims need `command: cmd` with `args: ["/c", "npx", ...]`.
+
+`strictMcpConfig: true` has one more consequence: on a machine with an enterprise-managed MCP config (`managed-mcp.json` under `/Library/Application Support/ClaudeCode`, `/etc/claude-code` or `C:\Program Files\ClaudeCode`) the CLI refuses the flag and exits. The bot checks for that file at startup and runs the platform without the flag, with a warning, because the organization's policy already decides which servers load there. The check is best-effort (the CLI also takes managed MCP from managed settings and, on Windows, the registry); when it misses, the first session's early-exit message names the refusal and the `strictMcpConfig: false` way out.
+
+The same exclusion applies to the bot's own haiku one-shots (watch confirms, distillation, routine and watch parsing, title suggestions): they run with the connectors disabled as well.
+
+If you relied on the connectors before 1.35.0, the bot tells you. At startup it runs one free `claude -p "/usage"` per account and reads the connectors from the CLI's init event; when an account has some and no platform allows them, the startup log names them with the `claudeAiConnectors: true` fix, and the channel sticky shows a `🔌 3 claude.ai connectors off` chip until you decide. With a platform opted in, the log lists which platforms have them instead.
+
+Each session logs the servers the CLI reported at start (`MCP servers: claude-threads-mcp (connected), github (failed)`) and warns when one did not connect. That line is the place to look when a declared server's tools do not show up, and it is where an old CLI's ignored `disableClaudeAiConnectors` becomes visible.
 
 ### Quieting the bot's overhead messages
 
@@ -664,3 +720,44 @@ The bot prevents system sleep while sessions are active (uses `caffeinate` on ma
 ---
 
 _claude-threads is maintained by [Axolotl Systems](https://axolotl.systems). If it makes your team faster, consider [sponsoring the project](https://github.com/sponsors/axolotl-systems)._
+
+## `!usage` output
+
+`!usage` reports the subscription windows for the seat the thread is running
+on; `!usage all` reports every account in the `claudeAccounts` pool. The
+numbers come from the same `/usage` probe the account router uses, so what you
+read and what routes can never disagree — it runs zero turns and costs $0.
+
+In a thread with **no session yet** there is no seat to report, so plain
+`!usage` behaves like `!usage all` and lists the whole pool — the seats the
+router would be choosing between. Asking before starting a session is the
+common case, and "which seat has headroom" is the useful answer there.
+
+`!usage` is restricted to users authorized in the thread — the platform's
+`allowedUsers`, plus anyone invited to that session. It spawns one probe per
+pooled seat and names the accounts, so it is not something a passing channel
+member can trigger inside someone else's thread.
+
+```yaml
+usage:
+  showEmails: true    # default false
+```
+
+`showEmails` adds each seat's login address to its row. Off by default: the
+quota bars say nothing about who owns a seat, the address does, and `!usage`
+answers into a channel several people can read and anyone in it can trigger.
+
+Turn it on when the pool is your own seats and directory names like `primary`
+and `backup` do not tell you which account is which — that is the case it
+exists for. The plan badge (`Max 20×`) is shown either way; it explains why one
+seat's week is four times another's and identifies nobody.
+
+Both the address and the badge are read from the profile's `.claude.json`.
+Nothing in `!usage` opens `.credentials.json` or the macOS Keychain.
+
+⚠️ The flag gates the address read from that metadata — it does not sanitize
+labels you chose yourself. A `claudeAccounts` entry whose `id` or `displayName`
+is an email address is printed as the row heading whether or not `showEmails`
+is on, because it is the name the account router uses and a row that cannot be
+matched to a routing decision is worse than useless. Name pool accounts
+`primary` / `backup`, not by address.

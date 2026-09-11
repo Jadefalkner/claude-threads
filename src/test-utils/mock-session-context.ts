@@ -49,6 +49,7 @@ export function createMockSessionContext(makePlatform: () => import('../platform
       permissionMode: 'bypass',
       chromeEnabled: false,
       debug: false,
+      bugReportsEnabled: true,
       maxSessions: 5,
     },
     state: {
@@ -100,6 +101,7 @@ export function createMockSessionContext(makePlatform: () => import('../platform
       getSessionId: mock((platformId, threadId) => `${platformId}:${threadId}`),
       findSessionByThreadId: mock((threadId) => sessions.get(`test-platform:${threadId}`)),
       registerPost: mock(() => {}),
+    beginInteractivePost: mock(() => () => {}),
       handleEvent: mock(() => {}),
       handleExit: mock(() => Promise.resolve()),
       startTyping: mock(() => {}),

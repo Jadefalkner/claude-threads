@@ -28,7 +28,10 @@ export function acquireInstanceLock(): () => void {
   const path = join(stateHome(), '.config', 'claude-threads', 'instance.lock');
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}`;
-  writeFileSync(tmp, String(process.pid));
+  // 0600 like every other file the bot writes under the state root. The
+  // parent dir is 0700 and the content is a bare pid, so nothing leaks
+  // either way, but this is the one state file that would deviate.
+  writeFileSync(tmp, String(process.pid), { mode: 0o600 });
   try {
     for (let attempt = 0; attempt < 5; attempt++) {
       let linked: boolean;

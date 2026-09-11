@@ -100,6 +100,23 @@ async function createPostAndTrack(session: Session, message: string): Promise<Pl
 // =============================================================================
 
 /**
+ * Whether error posts offer the 🐛 quick-report reaction. Module-level for the
+ * same reason `configureAuditLog` is: `postError` has 25 call sites and no
+ * `ctx`, and this is a process-wide setting resolved once at startup.
+ */
+let bugReportsEnabled = true;
+
+/** Set from the top-level `bugReports` config at startup. */
+export function configureBugReports(enabled: boolean): void {
+  bugReportsEnabled = enabled;
+}
+
+/** Read by the other error-post path in MessageManager. */
+export function bugReportsAreEnabled(): boolean {
+  return bugReportsEnabled;
+}
+
+/**
  * Post an error message (with X prefix).
  * Adds a bug reaction for quick error reporting.
  *
@@ -119,8 +136,11 @@ export async function postError(
 ): Promise<PlatformPost> {
   const result = await post(session, 'error', message);
 
-  // Add bug reaction for quick error reporting
-  if (addBugReaction) {
+  // Add bug reaction for quick error reporting.
+  // Not offered when the operator has disabled bug reporting: the reaction is
+  // an invitation to a path that will refuse, and in the deployments this
+  // switch exists for, the button should not be on the wall at all.
+  if (addBugReaction && bugReportsEnabled) {
     try {
       await session.platform.addReaction(result.id, BUG_REPORT_EMOJI);
       // Store error context for potential bug report
@@ -182,15 +202,47 @@ async function postWithReactions(
 export async function postInteractive(
   session: Session,
   message: string,
-  reactions: string[]
+  reactions: string[],
+  onPostCreated?: (post: PlatformPost) => void
 ): Promise<PlatformPost> {
-  const post = await session.platform.createInteractivePost(message, reactions, session.threadId);
-  updateLastMessage(session, post);
-  return post;
+  // Mark the create as in flight before it goes out: the platform accepts
+  // reactions on the post from the moment it stores it, which is earlier than
+  // the create response getting back to us. Without the marker a reaction in
+  // that window hits an unknown post id and is dropped for good.
+  // Guard the method itself, not just the manager: a session may carry a
+  // partial MessageManager (tests, and older persisted shapes), and losing the
+  // marker must degrade to the previous behavior rather than throw.
+  const doneInFlight =
+    typeof session.messageManager?.markInteractivePostInFlight === 'function'
+      ? session.messageManager.markInteractivePostInFlight()
+      : () => {};
+  try {
+    const post = await session.platform.createInteractivePost(
+      message,
+      reactions,
+      session.threadId,
+      (created) => {
+        onPostCreated?.(created);
+        // Registered (when the caller registers here) — release waiters now
+        // rather than after the option reactions land.
+        doneInFlight();
+      }
+    );
+    updateLastMessage(session, post);
+    return post;
+  } finally {
+    doneInFlight();
+  }
 }
 
 /**
  * Create an interactive post and register for reaction routing.
+ *
+ * Registration happens as soon as the post exists, BEFORE the option
+ * reactions are added — adding them is one API round trip each, and the post
+ * is already reactable throughout. Registering only after the call returned
+ * left a window in which `registry.findByPost` did not know the post yet and
+ * dropped the user's reaction silently.
  *
  * @param session - The session to post to
  * @param message - The message content
@@ -204,9 +256,9 @@ export async function postInteractiveAndRegister(
   reactions: string[],
   registerPost: (postId: string, threadId: string) => void
 ): Promise<PlatformPost> {
-  const post = await postInteractive(session, message, reactions);
-  registerPost(post.id, session.threadId);
-  return post;
+  return postInteractive(session, message, reactions, (created) =>
+    registerPost(created.id, session.threadId)
+  );
 }
 
 // =============================================================================

@@ -1,5 +1,7 @@
 import { WebSocket } from '../../utils/websocket.js';
+import type { McpServerConfig } from '../../config/types.js';
 import type { MattermostPlatformConfig } from '../../config/index.js';
+import { resolveReconnectPolicy } from '../../config/index.js';
 import { wsLogger, createLogger } from '../../utils/logger.js';
 import { formatShortId } from '../../utils/format.js';
 import { escapeRegExp, formatWebSocketError, resolvePostThreadId, isDcmThreadId, normalizeAckReaction, resolveDirectChannelMode, type ResolvedDirectChannelMode, type ApprovalsMode } from '../utils.js';
@@ -44,6 +46,9 @@ export class MattermostClient extends BasePlatformClient {
   private channelId: string;
   private directMessages: boolean;
   private outboundFiles?: { enabled?: boolean; maxBytes?: number };
+  private mcpServers?: Record<string, McpServerConfig>;
+  private strictMcpConfig?: boolean;
+  private claudeAiConnectors?: boolean;
   private userCache: Map<string, MattermostUser> = new Map();
   private botUserId: string | null = null;
   private readonly formatter = new MattermostFormatter();
@@ -62,9 +67,13 @@ export class MattermostClient extends BasePlatformClient {
     this.botName = platformConfig.botName;
     this.allowedUsers = platformConfig.allowedUsers;
     this.outboundFiles = platformConfig.outboundFiles;
+    this.mcpServers = platformConfig.mcpServers;
+    this.strictMcpConfig = platformConfig.strictMcpConfig;
+    this.claudeAiConnectors = platformConfig.claudeAiConnectors;
     this.directChannelMode = resolveDirectChannelMode(platformConfig.directChannelMode);
     this.approvals = platformConfig.approvals;
     this.ackReaction = normalizeAckReaction(platformConfig.ackReaction, `platforms[${platformConfig.id}].ackReaction`);
+    this.setReconnectPolicy(resolveReconnectPolicy(platformConfig.reconnectPolicy, `platforms[${platformConfig.id}]`));
   }
 
   // ============================================================================
@@ -755,6 +764,9 @@ export class MattermostClient extends BasePlatformClient {
       channelId: this.channelId,
       allowedUsers: this.allowedUsers,
       outboundFiles: this.outboundFiles,
+      mcpServers: this.mcpServers,
+      strictMcpConfig: this.strictMcpConfig,
+      claudeAiConnectors: this.claudeAiConnectors,
     };
   }
 
@@ -773,6 +785,12 @@ export class MattermostClient extends BasePlatformClient {
     }
     const targetId = lastMessageId || threadId;
     return `${this.url}/_redirect/pl/${targetId}`;
+  }
+
+  /** Heartbeat probe: Mattermost answers the `ping` action with a `pong` status reply. */
+  protected override sendHeartbeatProbe(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ action: 'ping', seq: Date.now() }));
   }
 
   // Send typing indicator via WebSocket

@@ -35,6 +35,35 @@ export function isOverheadVisibility(value: unknown): value is OverheadVisibilit
 }
 
 /**
+ * What a platform does when reconnection attempts are exhausted.
+ *
+ * - `retry` (default) — log at error, wait out a cool-down, reset the counter
+ *   and keep trying. Recovers with no supervisor, which is what an
+ *   interactively run bot needs: dying silently overnight because the wifi
+ *   dropped is a worse first impression than a noisy retry loop.
+ * - `exit` — leave through the graceful shutdown path and exit non-zero, for
+ *   deployments where `Restart=always` is the better recovery mechanism.
+ *
+ * Either way the "active but deaf" state — a live process whose socket is
+ * dead — is the one outcome that must not persist silently (#500).
+ */
+export type ReconnectPolicy = 'retry' | 'exit';
+
+export const RECONNECT_POLICY_VALUES: readonly ReconnectPolicy[] = ['retry', 'exit'] as const;
+
+export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = 'retry';
+
+export function resolveReconnectPolicy(value: unknown, fieldPath: string): ReconnectPolicy {
+  if (value === undefined || value === null) return DEFAULT_RECONNECT_POLICY;
+  if (typeof value === 'string' && (RECONNECT_POLICY_VALUES as readonly string[]).includes(value)) {
+    return value as ReconnectPolicy;
+  }
+  throw new Error(
+    `Invalid ${fieldPath}.reconnectPolicy: expected one of ${RECONNECT_POLICY_VALUES.join(', ')}, got ${JSON.stringify(value)}`,
+  );
+}
+
+/**
  * Normalize a per-platform overhead-visibility field. Undefined → default.
  * Throws on any other invalid value so config errors surface at startup
  * instead of silently falling back.
@@ -214,8 +243,188 @@ export function resolveAuditLogEnabled(value: unknown, fieldPath?: string): bool
 }
 
 /**
+ * Normalize the top-level `bugReports` field.
+ *
+ * `!bug` is the one command that sends session data OFF the operator's
+ * infrastructure: screenshots to a public anonymous file host, and a report
+ * body — session context plus recent daemon log lines — to a public GitHub
+ * issue on the maintainer's repository. Redaction is best-effort by
+ * construction, and `claudeCanExecute` means the agent can trigger it without
+ * a human typing anything.
+ *
+ * Unlike its siblings this **fails closed**: absent or `true` keeps today's
+ * behaviour, but any malformed value disables the feature rather than falling
+ * back to enabled. A `bugReports: "flase"` in a config an operator wrote in
+ * order to RESTRICT the bot must not silently leave the egress path open —
+ * the other flags fall back to something harmless, this one would not.
+ */
+export function resolveBugReportsEnabled(value: unknown, fieldPath?: string): boolean {
+  // Only a genuinely ABSENT key means "keep today's behaviour". `null` is what
+  // a bare `bugReports:` parses to — someone wrote the key, so they meant to
+  // set something, and a fail-closed flag must not read that as "on"
+  // (CodeRabbit review).
+  if (value === undefined) return true;
+  if (value === true) return true;
+  if (value === false) return false;
+  console.warn(
+    `Invalid ${fieldPath ?? 'bugReports'} config: expected boolean, got ${JSON.stringify(value)} — ` +
+    `bug reports are DISABLED (this flag fails closed: it controls data leaving your infrastructure)`,
+  );
+  return false;
+}
+
+/**
  * Thread logging configuration
  */
+// =============================================================================
+// MCP servers (#560)
+// =============================================================================
+
+/** Name of the bot's own MCP server in every `--mcp-config` blob. Reserved. */
+export const BOT_MCP_SERVER_NAME = 'claude-threads-mcp';
+
+/** A local MCP server: a process the Claude CLI spawns over stdio. */
+export interface McpStdioServerConfig {
+  type?: 'stdio';
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/** A remote MCP server reached over streamable HTTP or SSE. */
+export interface McpRemoteServerConfig {
+  type: 'http' | 'sse';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type McpServerConfig = McpStdioServerConfig | McpRemoteServerConfig;
+
+/** Discriminate on the normalized `type`, not on which keys happen to exist. */
+export function isRemoteMcpServer(server: McpServerConfig): server is McpRemoteServerConfig {
+  return server.type === 'http' || server.type === 'sse';
+}
+
+const STDIO_KEYS = new Set(['type', 'command', 'args', 'env']);
+const REMOTE_KEYS = new Set(['type', 'url', 'headers']);
+
+/**
+ * Normalize the per-platform `strictMcpConfig` field. Default `false`: the
+ * CLI loads the operator's own MCP sources as it always did (user-level
+ * servers, plugin servers, the repo's `.mcp.json`) on top of the bot's blob.
+ * `true` is the opt-in hardening: only the blob (the permission server plus
+ * `mcpServers`). Claude.ai connectors are governed separately, see
+ * `resolveClaudeAiConnectors`.
+ */
+export function resolveStrictMcpConfig(value: unknown, fieldPath?: string): boolean {
+  return resolveBooleanFeature(value, fieldPath ?? 'strictMcpConfig', {
+    default: false,
+    verb: 'the operator\'s MCP sources stay available',
+  });
+}
+
+/**
+ * Normalize the per-platform `claudeAiConnectors` field. Default `false`:
+ * the account's claude.ai connectors (Gmail, Google Drive, Calendar, ...)
+ * are disabled for the session via `disableClaudeAiConnectors` in the
+ * inline settings, so a bot run under a personal account does not hand the
+ * channel that person's mailbox (#560). `true` lets them through, for a
+ * platform whose users may act as that account.
+ */
+export function resolveClaudeAiConnectors(value: unknown, fieldPath?: string): boolean {
+  return resolveBooleanFeature(value, fieldPath ?? 'claudeAiConnectors', {
+    default: false,
+    verb: 'claude.ai connectors stay disabled',
+  });
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === 'object' && value !== null && !Array.isArray(value) &&
+    Object.values(value as Record<string, unknown>).every((v) => typeof v === 'string')
+  );
+}
+
+/**
+ * Validate one `mcpServers` map. Throws on the first malformed entry: a
+ * server the operator declared and the bot silently dropped would be worse
+ * than a startup error, because the session would just lack the tools.
+ */
+export function validateMcpServers(value: unknown, fieldPath: string): Record<string, McpServerConfig> {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(
+      `Invalid ${fieldPath}: expected a map of server name → {command, args?, env?} or {type: http|sse, url, headers?}`,
+    );
+  }
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, raw] of Object.entries(value as Record<string, unknown>)) {
+    const path = `${fieldPath}.${name}`;
+    if (name === BOT_MCP_SERVER_NAME) {
+      throw new Error(`Invalid ${path}: "${BOT_MCP_SERVER_NAME}" is the bot's own server and cannot be redefined`);
+    }
+    // The CLI folds other characters into "_" when it builds mcp__<server>__<tool>
+    // names, so two declared servers could collide; keep to what survives as-is.
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
+      throw new Error(`Invalid ${path}: server names may contain letters, digits, "_" and "-" only`);
+    }
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error(`Invalid ${path}: expected an object`);
+    }
+    // YAML leaves `args:` / `env:` with nothing after the colon as null;
+    // treat that like an absent key instead of a type error.
+    const s = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([, v]) => v !== null && v !== undefined));
+    if (typeof s.command === 'string' && typeof s.url === 'string') {
+      throw new Error(`Invalid ${path}: has both command (stdio) and url (http/sse); keep one`);
+    }
+    const type = s.type ?? (typeof s.url === 'string' ? 'http' : 'stdio');
+    if (type === 'http' || type === 'sse') {
+      const unknown = Object.keys(s).filter((k) => !REMOTE_KEYS.has(k));
+      if (unknown.length > 0) {
+        throw new Error(`Invalid ${path}: unknown key(s) ${unknown.join(', ')}; a ${type} server takes type, url, headers`);
+      }
+      if (typeof s.url !== 'string' || s.url.length === 0) {
+        throw new Error(`Invalid ${path}: a ${type} server needs a url`);
+      }
+      if (s.headers !== undefined && !isStringRecord(s.headers)) {
+        throw new Error(`Invalid ${path}.headers: expected a map of strings`);
+      }
+      out[name] = { type, url: s.url, ...(s.headers ? { headers: s.headers } : {}) };
+    } else if (type === 'stdio') {
+      const unknown = Object.keys(s).filter((k) => !STDIO_KEYS.has(k));
+      if (unknown.length > 0) {
+        throw new Error(`Invalid ${path}: unknown key(s) ${unknown.join(', ')}; a stdio server takes type, command, args, env`);
+      }
+      if (typeof s.command !== 'string' || s.command.length === 0) {
+        throw new Error(`Invalid ${path}: a stdio server needs a command (or set type: http|sse with a url)`);
+      }
+      if (s.args !== undefined && !(Array.isArray(s.args) && s.args.every((a) => typeof a === 'string'))) {
+        throw new Error(`Invalid ${path}.args: expected a list of strings`);
+      }
+      if (s.env !== undefined && !isStringRecord(s.env)) {
+        throw new Error(`Invalid ${path}.env: expected a map of strings`);
+      }
+      out[name] = { type: 'stdio', command: s.command, args: (s.args as string[] | undefined) ?? [], env: (s.env as Record<string, string> | undefined) ?? {} };
+    } else {
+      throw new Error(`Invalid ${path}.type: expected stdio, http or sse, got ${JSON.stringify(s.type)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * The servers one platform instance passes to the CLI: the top-level
+ * `mcpServers` merged with the platform's own, the platform winning on a
+ * name clash. Both maps are validated; an empty result is fine.
+ */
+export function resolveMcpServers(
+  global: unknown,
+  platform: unknown,
+  fieldPath: string,
+): Record<string, McpServerConfig> {
+  return { ...validateMcpServers(global, 'mcpServers'), ...validateMcpServers(platform, fieldPath) };
+}
+
 export interface ThreadLogsConfig {
   enabled?: boolean;        // Default: true
   retentionDays?: number;   // Default: 30 - days to keep logs after session ends
@@ -357,6 +566,21 @@ export interface ClaudeAccount {
   displayName?: string;
 }
 
+/** Options for the `!usage` command. */
+export interface UsageConfig {
+  /**
+   * Print each seat's login email address in `!usage` output. Default `false`.
+   *
+   * ⚠️ Off by default deliberately. The quota bars say nothing about who owns
+   * a seat; the address does, and `!usage` answers in a channel that several
+   * people can read and that anyone in it can trigger. Operators running a
+   * pool of their own seats generally want it on — it is the only thing that
+   * says WHICH account a row is about when directory names do not — but that
+   * is a decision to make, not to inherit.
+   */
+  showEmails?: boolean;
+}
+
 export interface Config {
   version: number;
   workingDir: string;
@@ -385,6 +609,12 @@ export interface Config {
    */
   userAttribution?: boolean;
   keepAlive?: boolean; // Optional, defaults to true when undefined
+  /**
+   * Allow `!bug` to file a report. Default `true`. Set `false` to remove the
+   * command entirely — see resolveBugReportsEnabled for what it sends and
+   * where. Fails closed on a malformed value.
+   */
+  bugReports?: boolean;
   autoUpdate?: Partial<AutoUpdateConfig>; // Optional auto-update configuration
   threadLogs?: ThreadLogsConfig; // Optional thread logging configuration
   limits?: LimitsConfig; // Optional resource limits and timeouts
@@ -397,6 +627,15 @@ export interface Config {
    * saved and listed like any other file. See docs/audio-transcription-spec.md.
    */
   transcription?: TranscriptionConfig;
+  /**
+   * MCP servers every platform instance passes to the Claude CLI, on top of
+   * the bot's own permission server. A platform's `mcpServers` entry with
+   * the same name wins. See `strictMcpConfig` on the platform for why these
+   * are the only servers a session sees.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+  /** `!usage` output options. */
+  usage?: UsageConfig;
   platforms: PlatformInstanceConfig[];
 }
 
@@ -447,6 +686,14 @@ export interface PlatformInstanceConfig {
    */
   ackReaction?: boolean | string;
   /**
+   * What to do when reconnection attempts are exhausted: `retry` (default,
+   * cool down and start over — recovers with no supervisor) or `exit` (leave
+   * through the graceful shutdown path and exit non-zero, for deployments
+   * where `Restart=always` is the better recovery mechanism). Either way the
+   * bot never stays live with a dead socket (#500).
+   */
+  reconnectPolicy?: ReconnectPolicy;
+  /**
    * Append-only audit trail of what the bot executed for this platform:
    * tool calls, session lifecycle, security-relevant commands, plan
    * approvals. One JSONL stream per platform under
@@ -484,6 +731,33 @@ export interface PlatformInstanceConfig {
    * `false` disables message evaluation and the !watch/!watches commands.
    */
   watches?: boolean;
+  /**
+   * Let sessions use the claude.ai connectors of the account the bot runs
+   * under (Gmail, Google Drive, Calendar, ...). Default `false`: they are
+   * disabled per session, because a bot run under a personal account used
+   * to hand every session in the channel that person's mailbox (#560).
+   * `true` only for a platform whose users may act as that account. Needs a
+   * CLI that knows `disableClaudeAiConnectors`; older CLIs ignore the
+   * setting, and the session log warns when connectors show up anyway.
+   */
+  claudeAiConnectors?: boolean;
+  /**
+   * Opt-in hardening (default `false`): pass `--strict-mcp-config`, so the
+   * CLI uses only the servers in the bot's own blob (its permission server
+   * plus `mcpServers`) and ignores every other MCP source: the account's
+   * user-level servers, servers bundled with plugins, and the repo's
+   * `.mcp.json`. Off by default because those sources are what "your
+   * machine, your setup" promises; turn it on for a channel that should get
+   * exactly the declared set and nothing else.
+   */
+  strictMcpConfig?: boolean;
+  /**
+   * Extra MCP servers for this platform's sessions, merged over the top-level
+   * `mcpServers`. Keyed by server name; each entry is either a stdio server
+   * (`command`, optional `args`/`env`) or a remote one (`type: http|sse`,
+   * `url`, optional `headers`). The name `claude-threads-mcp` is reserved.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
   /**
    * Transcribe inbound audio attachments in this platform's channels
    * (default: enabled wherever the top-level `transcription:` block is

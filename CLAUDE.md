@@ -116,6 +116,12 @@ worktreeMode: prompt
 respondOnlyWhenMentioned: false   # New threads only reply when @mentioned (per-thread !mentions overrides)
 userAttribution: true             # Prefix user turns with [@username]: so Claude can tell speakers apart (default on; only applied once a thread has >1 participant)
 
+# Optional: MCP servers every platform's sessions get, on top of the bot's own
+# and the account's user-level / plugin / .mcp.json servers. The account's
+# claude.ai connectors are the one thing kept out by default (#560).
+mcpServers:
+  docs: { type: http, url: https://mcp.example.com/ }
+
 # Optional: Customize the sticky channel message
 stickyMessage:
   description: "Porygon — Mixpanel analytics bot"    # Shown below the title
@@ -132,6 +138,10 @@ platforms:
     botName: claude-code
     allowedUsers: [alice, bob]
     skipPermissions: false
+    claudeAiConnectors: false        # default; true lets the account's Gmail/Drive/Calendar into sessions (#560)
+    strictMcpConfig: false           # default; true = only the bot's blob (permission server + mcpServers)
+    mcpServers:                      # per-platform servers, merged over the top-level map
+      github: { command: npx, args: [-y, "@modelcontextprotocol/server-github"], env: { GITHUB_TOKEN: ghp-x } }
 
   # Slack configuration
   - id: slack-workspace
@@ -370,8 +380,10 @@ Invariants:
 |------|---------|
 | `src/index.ts` | Entry point. CLI parsing, bot startup, UI rendering |
 | `src/message-handler.ts` | Message routing logic (extracted for testability) |
-| `src/config.ts` | Type exports for config (re-exports from migration.ts) |
-| `src/config/migration.ts` | YAML config loading (`config.yaml`) |
+| `src/config/index.ts` | YAML config loading (`config.yaml`), re-exports of the config types and resolvers |
+| `src/config/types.ts` | Config types plus the per-platform resolvers (memory, routines, watches, audit log, MCP servers, `strictMcpConfig`, `claudeAiConnectors`) |
+| `src/config/mcp-posture.ts` | Startup resolution of each platform's MCP posture; downgrades `strictMcpConfig` when an enterprise managed MCP config is present |
+| `src/config/managed-mcp.ts` | Detection of the CLI's enterprise `managed-mcp.json` paths |
 | `src/onboarding.ts` | Interactive setup wizard for multi-platform config |
 
 ### Session Management
@@ -434,7 +446,8 @@ Each executor owns a specific piece of interactive state:
 | File | Purpose |
 |------|---------|
 | `src/claude/cli.ts` | Spawns Claude CLI with platform-specific MCP config |
-| `src/claude/types.ts` | TypeScript types for Claude stream-json events |
+| `src/claude/quick-query.ts` | One-shot `claude -p` helper (haiku) behind routine/watch parsing, watch confirms, distillation and title suggestions; spawns with the same child env as a session |
+| `src/claude/connector-probe.ts` | Startup probe (`claude -p /usage`, free) for the claude.ai connectors an account has, behind the "connectors off" notice and sticky chip |
 | `src/claude/version-check.ts` | Claude CLI version validation and compatibility check |
 
 ### Platform Layer
@@ -455,7 +468,8 @@ Each executor owns a specific piece of interactive state:
 | `src/platform/slack/formatter.ts` | Slack mrkdwn formatter |
 | `src/platform/slack/mcp-platform-api.ts` | Slack MCP platform API (used by MCP child) |
 | `src/platform/slack/permalink.ts` | Slack permalink parser + resolver + formatter for `read_post` |
-| `src/platform/slack/index.ts` | Slack module exports |
+| `src/platform/slack/upload.ts` | Slack file upload |
+| `src/platform/slack/status.ts` | Slack assistant-thread status (the working indicator) |
 | `src/platform/permalink-shared.ts` | Cross-platform permalink utilities (caps, truncation, quote-block) shared by both permalink modules |
 | `src/platform/test-helpers/fetch-harness.ts` | Shared `fetch` recorder + responder for platform-API unit tests |
 
@@ -475,7 +489,8 @@ Each executor owns a specific piece of interactive state:
 | `src/mcp/decision-bridge.ts` | Per-session local socket between bot and MCP permission server; routes ExitPlanMode approvals and AskUserQuestion answers through the bot's reaction UI |
 | `src/platform/mcp-platform-api-factory.ts` | Factory for platform-specific MCP platform APIs |
 | `src/platform/mcp-platform-api.ts` | McpPlatformApi interface |
-| `src/mattermost/api.ts` | Standalone Mattermost API helpers |
+| `src/platform/mattermost/mcp-platform-api.ts` | Mattermost MCP platform API (used by MCP child) |
+| `src/utils/websocket.ts` | WebSocket compat layer (global vs the `ws` package) and `countPingsAsActivity` for the heartbeat |
 | `src/persistence/session-store.ts` | Multi-platform session persistence |
 | `src/ui/components/Header.tsx` | Terminal header with the ASCII logo |
 
@@ -564,8 +579,15 @@ different jobs:
 bump therefore lands, goes green, and never reaches CI — because the version CI
 installs still comes from `bun.lock`. This is not hypothetical; #434 and #442
 both needed `bun.lock` regenerated by hand before the bump took effect.
-`.github/workflows/dependabot-sync-lockfile.yml` now does that automatically on
-Dependabot's PRs.
+`.github/workflows/dependabot-sync-lockfile.yml` does that automatically on
+Dependabot's PRs by deleting `bun.lock` and letting `bun install` migrate the
+resolutions from `package-lock.json`. A plain `bun install` is not enough: for
+a transitive bump (every security PR, e.g. #543) `package.json` is unchanged and
+the old `bun.lock` entry still satisfies its range, so nothing moves. That is
+how 1.34.1 shipped with four advisories that `bun audit` could see and
+Dependabot could not (Dependabot reads `package-lock.json`, which was already
+patched). Note that `bun build --target node` bundles dependencies into
+`dist/`, so the versions in `bun.lock` are the versions users run.
 
 Note that the two lockfiles **cannot be kept fully identical** — npm and bun hoist
 transitive trees differently, and both results are valid, so dozens of
@@ -594,6 +616,13 @@ the floor strands users on otherwise-supported LTS lines. Forced to 20 by
   only exists on newer Node breaks the build before reaching users.
 - `ci.yml` has a `node-smoke` matrix (`[20, 22, 24]`) that runs the built
   binary under each currently-relevant Node line.
+- `ci.yml` also has a `node-e2e` matrix (same Node lines) that runs
+  `tests/node-e2e/`: the built bot as `node dist/index.js --headless` against
+  the in-process Slack mock with the mock Claude CLI, through one real session
+  (mention over Socket Mode, reply, graceful SIGTERM, exit 0). Every other
+  test runs the bot's code inside bun; this is the only one that runs what
+  users run. #569 (a listener leak that only exists under Node's
+  `EventEmitter`) is the reason it exists. Locally: `bun run test:node-e2e`.
 
 **When to bump the floor**: only when a real dep forces it. Update
 `package.json#engines.node`, `publish.yml` Node version, the `node-smoke`
@@ -610,7 +639,7 @@ The version is checked at startup against a three-tier policy
 | CLI version | Behavior |
 |-------------|----------|
 | Below `2.0.74` (hard floor) | Error message and **exit** — the bot can't work at all |
-| `>=2.0.74 <2.2.0` (verified range; latest verified: 2.1.251) | Runs normally |
+| `>=2.0.74 <2.2.0` (verified range; latest verified: 2.1.263) | Runs normally |
 | Newer 2.x above the verified range | **Warn-and-run**: startup warning + "⚠️ untested" marker in the sticky message and session headers. A new CLI minor must not take every bot down until a claude-threads release ships |
 | A new major (3.x+) | Error message and **exit** — different contract, warn-and-run would be reckless |
 
@@ -621,7 +650,7 @@ next to the CLI version in the sticky message and session headers.
 
 To install the latest verified version:
 ```bash
-npm install -g @anthropic-ai/claude-code@2.1.251
+npm install -g @anthropic-ai/claude-code@2.1.263
 ```
 
 The Claude CLI version is displayed:
@@ -647,6 +676,7 @@ bun run build        # Compile TypeScript to dist/
 bun run dev          # Run from source with watch mode
 bun start            # Run compiled version
 bun run test         # Run unit tests (~3000 tests)
+bun run test:node-e2e  # Build, then drive the built bot under Node through one session (Slack mock)
 bun run lint         # Run ESLint
 ```
 
