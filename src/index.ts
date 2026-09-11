@@ -38,7 +38,11 @@ import { VERSION } from './version.js';
 import { keepAlive } from './utils/keep-alive.js';
 import { startReactMeasureCleanup } from './utils/perf-cleanup.js';
 import { dim, red, yellow } from './utils/colors.js';
-import { validateClaudeCli } from './claude/version-check.js';
+import { validateClaudeCli, type ClaudeValidationResult } from './claude/version-check.js';
+import { setQuickQueryBackend } from './claude/quick-query.js';
+import { acquireInstanceLock, LOCKED_EXIT_CODE } from './utils/instance-lock.js';
+import { validateCodexCli } from './agents/codex/version-check.js';
+import { CODEX_PROTOCOL_VERSION } from './agents/codex/app-server.js';
 import { startUI, type UIProvider } from './ui/index.js';
 import { setLogHandler } from './utils/logger.js';
 import { handleMessage } from './message-handler.js';
@@ -49,7 +53,6 @@ import {
   getRuntimeSettings,
   clearRuntimeSettings,
 } from './auto-update/installer.js';
-import { acquireInstanceLock, LOCKED_EXIT_CODE } from './utils/instance-lock.js';
 
 // =============================================================================
 // Platform Factory and Event Wiring
@@ -432,8 +435,11 @@ async function startWithoutDaemon() {
       ?? firstPlatformConfig.skipPermissions,
   });
 
-  // Check Claude CLI version
-  const claudeValidation = validateClaudeCli();
+  // Check Claude CLI version — only when Claude is the backend. A codex-only
+  // bot must never touch the Claude CLI (handoff Punkt 8).
+  const claudeValidation = (config.agentBackend ?? 'claude') === 'claude'
+    ? validateClaudeCli()
+    : { installed: false, version: null, compatible: true, status: 'ok', message: 'Claude CLI not required (codex backend)' } satisfies ClaudeValidationResult;
 
   // Fail on incompatible version unless --skip-version-check is set.
   // Incompatible = below the hard floor or a new major; an untested newer
@@ -445,6 +451,32 @@ async function startWithoutDaemon() {
     console.error(dim(`  Use --skip-version-check to bypass this check (not recommended)`));
     console.error('');
     process.exit(1);
+  }
+  // Backend config is YAML-typed only: fail loudly on anything but the two
+  // known values, and keep a Codex-only bot Codex-only — an account pool
+  // would start Claude usage probes regardless of the session backend.
+  if (config.agentBackend !== undefined && config.agentBackend !== 'claude' && config.agentBackend !== 'codex') {
+    console.error(red(`  ❌ Invalid agentBackend: "${String(config.agentBackend)}". Must be "claude" or "codex".`));
+    console.error('');
+    process.exit(1);
+  }
+  if (config.agentBackend === 'codex' && config.claudeAccounts?.length) {
+    console.error(red('  ❌ claudeAccounts is Claude-only. Remove it for agentBackend: codex (or drop the codex backend).'));
+    console.error('');
+    process.exit(1);
+  }
+  if ((config.agentBackend ?? 'claude') === 'codex') {
+    setQuickQueryBackend('codex');
+    const codex = validateCodexCli();
+    if (!codex.installed || !codex.loggedIn) {
+      console.error(red(`  ❌ ${codex.message}`));
+      console.error('');
+      process.exit(1);
+    }
+    if (codex.version !== CODEX_PROTOCOL_VERSION) {
+      console.error(yellow(`  ⚠️  ${codex.message}`));
+      console.error('');
+    }
   }
   if (claudeValidation.status === 'untested') {
     console.error(yellow(`  ⚠️  ${claudeValidation.message}`));
@@ -699,7 +731,8 @@ async function startWithoutDaemon() {
     config.respondOnlyWhenMentioned,  // Quiet-mode default for new sessions (#402)
     config.userAttribution,  // Per-message [@username]: attribution (default on; only applied once a thread has >1 participant)
     bugReportsEnabled,  // `!bug` files publicly; false removes the whole path
-    config.usage  // !usage output options (emails off unless turned on)
+    config.usage,  // !usage output options (emails off unless turned on)
+    config.agentBackend ?? 'claude'  // Backend for new sessions
   );
 
   // Set sticky message customization from config

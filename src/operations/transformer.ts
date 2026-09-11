@@ -100,6 +100,15 @@ export function transformEvent(
     case 'result':
       return transformResult(event, ctx);
 
+    // Codex-only: an in-process approval request (command / file change).
+    // Rendered as an 'action' approval; the decision travels back through the
+    // events handler (src/operations/events/handler.ts) to the agent.
+    case 'approval_request': {
+      const e = event as ClaudeEvent & { request_id?: string; tool_name?: string; content?: string };
+      if (!e.request_id) return [];
+      return [createApprovalOp(ctx.sessionId, e.request_id, 'action', `${e.tool_name ?? 'Tool'}: ${e.content ?? ''}`)];
+    }
+
     default:
       // Unknown event type - no operations
       return [];

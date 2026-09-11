@@ -22,7 +22,7 @@ import { isAuthorizedForSession, sessionAllowedUserSet } from './authorization.j
 import type { PlatformClient, PlatformFile } from '../platform/index.js';
 import type { ClaudeCliOptions, ClaudeEvent, RateLimitHit } from '../claude/cli.js';
 import { DecisionBridgeServer, BridgeUnavailableError } from '../mcp/decision-bridge.js';
-import { ClaudeCli } from '../claude/cli.js';
+import { createAgentSession, type AgentSession } from '../agents/index.js';
 import { cooldownDeadline } from '../claude/rate-limit-detector.js';
 import { isRevivable } from '../persistence/session-store.js';
 import type { PersistedSession } from '../persistence/session-store.js';
@@ -530,7 +530,13 @@ function createMessageManager(
   // Subscribe to events from MessageManager
   // These replace the callback-based approach for cleaner separation of concerns
 
-  messageManager.events.on('question:complete', ({ toolUseId: _toolUseId, answers }) => {
+  messageManager.events.on('question:complete', ({ toolUseId, answers }) => {
+    if (session.claude.backend === 'codex' && session.claude.respondToQuestion) {
+      session.claude.respondToQuestion(answers, toolUseId);
+      sessionLog(session).info('Question answered → codex');
+      ctx.ops.startTyping(session);
+      return;
+    }
     // On modern CLIs AskUserQuestion blocks on the MCP permission prompt; the
     // decision bridge delivers the answers through the permission response's
     // updatedInput, and a stdin send would arrive as a stray extra user
@@ -544,7 +550,16 @@ function createMessageManager(
     session.claude.sendMessage(answerJson);
   });
 
-  messageManager.events.on('approval:complete', ({ toolUseId: _toolUseId, approved }) => {
+  messageManager.events.on('approval:complete', ({ toolUseId, approved, allowAll }) => {
+    // Codex: approvals are in-process server requests keyed by request id
+    // (== the approval op's toolUseId). A late reaction after the agent's
+    // timeout is a no-op there — never echo 'approved' as a user message.
+    if (session.claude.backend === 'codex' && session.claude.respondToApproval) {
+      session.claude.respondToApproval(toolUseId, approved, allowAll);
+      sessionLog(session).info(`Action ${approved ? 'approved' : 'denied'} → codex ${toolUseId}`);
+      ctx.ops.startTyping(session);
+      return;
+    }
     // Same split as questions: on modern CLIs the plan approval resolves the
     // blocked ExitPlanMode permission request via the bridge — the CLI then
     // tells Claude "User has approved your plan" itself.
@@ -1096,9 +1111,9 @@ async function startSessionImpl(
       ctx.ops,
     ),
   };
-  let claude: ClaudeCli;
+  let claude: AgentSession;
   try {
-    claude = new ClaudeCli(cliOptions);
+    claude = createAgentSession(ctx.config.agentBackend ?? 'claude', cliOptions);
   } catch (err) {
     // The bridge has no owner yet — close it here or it leaks its socket dir
     void decisionBridge?.close();
@@ -1113,6 +1128,7 @@ async function startSessionImpl(
     platform,
     claudeSessionId,
     claudeAccountId: claudeAccount?.id,
+    agentBackend: ctx.config.agentBackend ?? 'claude',
     unattended: options.unattended || undefined,
     startedBy: username,
     startedByDisplayName: displayName,
@@ -1509,9 +1525,9 @@ async function resumeSessionImpl(
       ctx.ops,
     ),
   };
-  let claude: ClaudeCli;
+  let claude: AgentSession;
   try {
-    claude = new ClaudeCli(cliOptions);
+    claude = createAgentSession(state.agentBackend ?? 'claude', cliOptions);
   } catch (err) {
     // The bridge has no owner yet — close it here or it leaks its socket dir
     void resumeBridge?.close();
@@ -1526,6 +1542,7 @@ async function resumeSessionImpl(
     platform,
     claudeSessionId: state.claudeSessionId,
     claudeAccountId: claudeAccount?.id,
+    agentBackend: state.agentBackend ?? 'claude',
     unattended: _resumedUnattended(state) || undefined,
     startedBy: state.startedBy,
     startedByDisplayName: state.startedByDisplayName,
@@ -1963,7 +1980,7 @@ export async function handleExit(
   sessionId: string,
   code: number,
   ctx: SessionContext,
-  source?: ClaudeCli
+  source?: AgentSession
 ): Promise<void> {
   const session = mutableSessions(ctx).get(sessionId);
   const shortId = sessionId.substring(0, 8);

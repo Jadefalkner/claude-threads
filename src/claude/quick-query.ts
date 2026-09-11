@@ -11,6 +11,10 @@
  * Defaults to haiku for speed/cost efficiency.
  */
 
+import { join } from 'path';
+import { randomUUID } from 'crypto';
+import { tmpdir } from 'os';
+import { readFileSync, unlinkSync } from 'fs';
 import { crossSpawn } from '../utils/spawn.js';
 import { buildClaudeChildEnv } from './cli.js';
 import { getClaudePath } from './version-check.js';
@@ -58,7 +62,18 @@ export interface QuickQueryResult {
  *   console.log(result.response);
  * }
  */
+/**
+ * Which CLI answers one-shot helper queries (titles, branch names, routine
+ * parses …). Set once at startup from `config.agentBackend`: a codex-only bot
+ * must never spawn the Claude CLI, not even for a haiku one-shot.
+ */
+let quickQueryBackend: 'claude' | 'codex' = 'claude';
+export function setQuickQueryBackend(backend: 'claude' | 'codex'): void {
+  quickQueryBackend = backend;
+}
+
 export async function quickQuery(options: QuickQueryOptions): Promise<QuickQueryResult> {
+  if (quickQueryBackend === 'codex') return codexQuickQuery(options);
   const {
     prompt,
     model = 'haiku',
@@ -174,5 +189,55 @@ export async function quickQuery(options: QuickQueryOptions): Promise<QuickQuery
       log.debug(`quickQuery: stdin write failed (${(err as NodeJS.ErrnoException).code ?? err.message})`);
     });
     proc.stdin?.end(prompt);
+  });
+}
+
+/**
+ * Codex flavour of quickQuery: `codex exec --ephemeral` with the prompt on
+ * stdin, the final message read from `-o <file>`. Model names are Codex's,
+ * so the Claude `model` option is ignored (the user's default model applies).
+ */
+async function codexQuickQuery(options: QuickQueryOptions): Promise<QuickQueryResult> {
+  const { prompt, workingDir, systemPrompt } = options;
+  // codex exec needs ~6-7 s even for a one-word answer (measured 0.153.4);
+  // callers tuned for haiku (5-15 s) would time out under load.
+  const timeout = Math.max(options.timeout ?? 5000, 20000);
+  const startTime = Date.now();
+  const outFile = join(tmpdir(), `claude-threads-codex-qq-${randomUUID()}.txt`); // title+tags run concurrently
+  const args = ['exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-o', outFile, '--color', 'never'];
+  const input = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
+  log.debug(`Quick query (codex): timeout=${timeout}ms, prompt="${prompt.substring(0, 50)}..."`);
+  return new Promise<QuickQueryResult>((resolve) => {
+    let stderr = '';
+    let resolved = false;
+    const finish = (r: QuickQueryResult) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeoutId);
+      try { unlinkSync(outFile); } catch { /* best-effort */ }
+      resolve(r);
+    };
+    const proc = crossSpawn(process.env.CODEX_BIN ?? 'codex', args, {
+      cwd: workingDir || process.cwd(),
+      env: process.env,
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    const timeoutId = setTimeout(() => {
+      proc.kill('SIGTERM');
+      finish({ success: false, error: 'timeout', durationMs: Date.now() - startTime });
+    }, timeout);
+    proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on('error', (err) => finish({ success: false, error: err.message, durationMs: Date.now() - startTime }));
+    proc.on('exit', (code) => {
+      let response = '';
+      try { response = readFileSync(outFile, 'utf8').trim(); } catch { /* no output file */ }
+      const durationMs = Date.now() - startTime;
+      if (code === 0 && response) finish({ success: true, response, durationMs });
+      else finish({ success: false, error: `exit ${code}: ${stderr.trim().slice(-500)}`, durationMs });
+    });
+    proc.stdin?.on('error', (err) => {
+      log.debug(`quickQuery (codex): stdin write failed (${(err as NodeJS.ErrnoException).code ?? err.message})`);
+    });
+    proc.stdin?.end(input);
   });
 }

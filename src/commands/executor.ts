@@ -621,6 +621,10 @@ function createPassthroughHandler(slashCommand: string): CommandHandler {
       return { handled: false }; // Passthrough commands don't work in first message
     }
     if (ctx.isAllowed) {
+      // A non-Claude backend may implement the command natively.
+      if (await ctx.sessionManager.runBackendCommand(ctx.threadId, slashCommand, args)) {
+        return { handled: true };
+      }
       const full = args ? `/${slashCommand} ${args}` : `/${slashCommand}`;
       // Authorization was already verified upstream (ctx.isAllowed). Mark this
       // as a system follow-up so the sink's identity gate (#388) does not
